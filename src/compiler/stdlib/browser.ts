@@ -14,12 +14,54 @@ export const BROWSER_STDLIB_SOURCE = `
   };
 
   const browserAlert = (msg = "") => {
-    const text = formatVal(msg);
+    const text = msg === undefined ? "" : formatVal(msg);
     if (ioHandler && typeof ioHandler.onAlert === "function") {
       return ioHandler.onAlert(text);
     }
     console.log("[alert] " + text);
-    return text;
+    return undefined;
+  };
+
+  const browserConfirm = (msg = "") => {
+    const text = msg === undefined ? "" : formatVal(msg);
+    if (stdinQueue.length > 0) {
+      const val = String(stdinQueue.shift()).trim().toLowerCase();
+      if (ioHandler && typeof ioHandler.onEcho === "function") {
+        ioHandler.onEcho(text, val);
+      }
+      return ["y", "yes", "true", "1", "ok"].includes(val);
+    }
+    if (ioHandler && typeof ioHandler.onConfirm === "function") {
+      return ioHandler.onConfirm(text);
+    }
+    if (ioHandler && typeof ioHandler.onInput === "function") {
+      const res = ioHandler.onInput(text);
+      if (res && typeof res.then === "function") {
+        return res.then((v) => ["y", "yes", "true", "1", "ok"].includes(String(v).trim().toLowerCase()));
+      }
+      return ["y", "yes", "true", "1", "ok"].includes(String(res).trim().toLowerCase());
+    }
+    return false;
+  };
+
+  const browserPrompt = (msg = "", defaultValue = "") => {
+    const text = msg === undefined ? "" : formatVal(msg);
+    const def = defaultValue === undefined || defaultValue === null ? "" : String(defaultValue);
+    if (stdinQueue.length > 0) {
+      const next = stdinQueue.shift();
+      const result = next === null ? null : String(next);
+      if (ioHandler && typeof ioHandler.onEcho === "function") {
+        ioHandler.onEcho(text, result === null ? "(cancelled)" : result);
+      }
+      return result;
+    }
+    if (ioHandler && typeof ioHandler.onPrompt === "function") {
+      return ioHandler.onPrompt(text, def);
+    }
+    if (ioHandler && typeof ioHandler.onInput === "function") {
+      return ioHandler.onInput(text);
+    }
+    return def;
   };
 
   const browserOpen = (url) => {

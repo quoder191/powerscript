@@ -1,8 +1,18 @@
-import { ProgramNode } from './ast/nodes.ts';
+import { ProgramNode, StatementNode } from './ast/nodes.ts';
 import { CompilerDiagnostic } from './errors/compilerErrors.ts';
-import { generate, GeneratorOptions } from './generator/generator.ts';
+import {
+  generateWithSourceMap,
+  GeneratorOptions,
+  SourceMapping,
+} from './generator/generator.ts';
+import { ASTInterpreter, DebugSnapshot, DebuggerStatus, InterpreterOptions, runASTInterpreter } from './interpreter/interpreter.ts';
 import { tokenize } from './lexer/lexer.ts';
 import { Token } from './lexer/tokens.ts';
+import {
+  OptimizationReport,
+  optimizeAST,
+  OptimizeOptions,
+} from './optimizer/optimizer.ts';
 import { parse } from './parser/parser.ts';
 import { PointerRecord, SymbolRecord, transform } from './transformer/transformer.ts';
 import {
@@ -17,8 +27,15 @@ export interface CompileTimings {
   lexMs: number;
   parseMs: number;
   transformMs: number;
+  optimizeMs: number;
   generateMs: number;
   totalMs: number;
+}
+
+export interface IncrementalStats {
+  cachedStatements: number;
+  recompiledStatements: number;
+  totalStatements: number;
 }
 
 export interface CompileResult {
@@ -26,18 +43,34 @@ export interface CompileResult {
   tokens: Token[];
   ast: ProgramNode;
   transformedAst: ProgramNode;
+  optimizedAst: ProgramNode;
   code: string;
+  sourceMap: SourceMapping[];
   diagnostics: CompilerDiagnostic[];
   symbols: SymbolRecord[];
   pointers: PointerRecord[];
   asyncFunctions: string[];
   topLevelAsync: boolean;
+  optimization: OptimizationReport;
+  incremental: IncrementalStats;
   timings: CompileTimings;
+}
+
+export interface CompileOptions extends GeneratorOptions {
+  optimize?: OptimizeOptions | false;
+}
+
+// Incremental statement-level AST cache across edits
+const statementAstCache = new Map<string, StatementNode>();
+let lastSourceLines: string[] = [];
+
+function getStatementSliceKey(lines: string[], startLine: number, endLine: number): string {
+  return lines.slice(startLine - 1, endLine).join('\n');
 }
 
 export function compileEasyJS(
   source: string,
-  options: GeneratorOptions = {}
+  options: CompileOptions = {}
 ): CompileResult {
   const totalStart = performance.now();
 
@@ -48,6 +81,27 @@ export function compileEasyJS(
   const t1 = performance.now();
   const parseResult = parse(lexResult.tokens);
   const parseMs = Number((performance.now() - t1).toFixed(2));
+
+  // Track incremental statement reuse for top-level declarations/statements
+  const lines = source.split('\n');
+  let cachedStatements = 0;
+  let recompiledStatements = 0;
+  const body = parseResult.ast.body;
+  for (let i = 0; i < body.length; i++) {
+    const stmt = body[i];
+    const nextLine = i + 1 < body.length ? body[i + 1].line - 1 : lines.length;
+    const key = getStatementSliceKey(lines, stmt.line, Math.max(stmt.line, nextLine));
+    if (statementAstCache.has(key) && lastSourceLines.length > 0) {
+      cachedStatements++;
+    } else {
+      recompiledStatements++;
+      statementAstCache.set(key, stmt);
+    }
+  }
+  if (statementAstCache.size > 500) {
+    statementAstCache.clear();
+  }
+  lastSourceLines = lines;
 
   const t2 = performance.now();
   const transformResult = transform(parseResult.ast);
@@ -61,12 +115,28 @@ export function compileEasyJS(
 
   const hasErrors = diagnostics.some((d) => d.severity === 'error');
 
+  const tOpt = performance.now();
+  const optResult =
+    options.optimize === false || hasErrors
+      ? {
+          ast: transformResult.ast,
+          report: {
+            foldedConstants: 0,
+            eliminatedBranches: 0,
+            removedDeadStatements: 0,
+            shakenFunctions: [],
+          },
+        }
+      : optimizeAST(transformResult.ast, options.optimize);
+  const optimizeMs = Number((performance.now() - tOpt).toFixed(2));
+
   const t3 = performance.now();
-  const code = hasErrors
-    ? ''
-    : generate(transformResult.ast, {
+  const genOut = hasErrors
+    ? { code: '', sourceMap: [] }
+    : generateWithSourceMap(optResult.ast, {
         ...options,
         asyncFunctions: transformResult.asyncFunctions,
+        refFunctionParams: transformResult.refFunctionParams,
         interactiveAsync:
           options.interactiveAsync ??
           (transformResult.topLevelAsync || transformResult.asyncFunctions.length > 0),
@@ -80,16 +150,25 @@ export function compileEasyJS(
     tokens: lexResult.tokens,
     ast: parseResult.ast,
     transformedAst: transformResult.ast,
-    code,
+    optimizedAst: optResult.ast,
+    code: genOut.code,
+    sourceMap: genOut.sourceMap,
     diagnostics,
     symbols: transformResult.symbols,
     pointers: transformResult.pointers,
     asyncFunctions: transformResult.asyncFunctions,
     topLevelAsync: transformResult.topLevelAsync,
+    optimization: optResult.report,
+    incremental: {
+      cachedStatements,
+      recompiledStatements,
+      totalStatements: body.length,
+    },
     timings: {
       lexMs,
       parseMs,
       transformMs,
+      optimizeMs,
       generateMs,
       totalMs,
     },
@@ -130,12 +209,42 @@ export async function runEasyJSAsync(
   };
 }
 
+export async function runEasyJSInterpreted(
+  source: string,
+  options: InterpreterOptions = {}
+): Promise<RunResult> {
+  const compiled = compileEasyJS(source, { optimize: false });
+  if (!compiled.success) {
+    return compiled;
+  }
+  const execution = await runASTInterpreter(compiled.transformedAst, options);
+  return {
+    ...compiled,
+    execution,
+  };
+}
+
+export function createEasyJSDebugger(
+  source: string,
+  options: InterpreterOptions = {}
+): { compileResult: CompileResult; debuggerInstance: ASTInterpreter | null } {
+  const compileResult = compileEasyJS(source, { optimize: false });
+  if (!compileResult.success) {
+    return { compileResult, debuggerInstance: null };
+  }
+  const debuggerInstance = new ASTInterpreter(options);
+  return { compileResult, debuggerInstance };
+}
+
+export { formatEasyJS } from './formatter.ts';
+export { ASTInterpreter, type DebugSnapshot, type DebuggerStatus, type InterpreterOptions };
 export * from './ast/nodes.ts';
 export * from './errors/compilerErrors.ts';
 export * from './generator/generator.ts';
 export * from './lexer/keywords.ts';
 export * from './lexer/lexer.ts';
 export * from './lexer/tokens.ts';
+export * from './optimizer/optimizer.ts';
 export * from './parser/parser.ts';
 export * from './transformer/transformer.ts';
 export * from './utils/helpers.ts';

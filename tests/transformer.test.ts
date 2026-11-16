@@ -88,6 +88,42 @@ export function runTransformerTests(): TestCaseResult[] {
         assertTrue(res.symbols.some((s) => s.name === 'secret' && s.scopeDepth === 1), 'secret isolated in scope 1');
       },
     },
+    {
+      name: 'Catches static Type Error on incompatible typed variable or union reassignment',
+      fn: () => {
+        const src = `
+          var age: number = 15
+          age = "hello"
+          var tag: number or string = 10
+          tag = "valid"
+        `;
+        const res = transform(parse(tokenize(src).tokens).ast);
+        assertTrue(res.diagnostics.length === 1, `Expected 1 Type Error, got ${res.diagnostics.length}`);
+        assertTrue(
+          res.diagnostics[0].title === 'Type Error',
+          `Expected Type Error title, got ${res.diagnostics[0].title}`
+        );
+      },
+    },
+    {
+      name: 'Rewrites ClassName() calls without new keyword into NewExpression',
+      fn: () => {
+        const src = `
+          class Point {
+            pub x: int
+            init(x: int) { self.x = x }
+          }
+          p = Point(42)
+        `;
+        const res = transform(parse(tokenize(src).tokens).ast);
+        assertTrue(res.diagnostics.length === 0, 'Expected zero diagnostics');
+        const decl = res.ast.body[1];
+        assertTrue(
+          decl.kind === 'VarDeclaration' && decl.initializer?.kind === 'NewExpression',
+          'Expected ClassName() call to transform to NewExpression'
+        );
+      },
+    },
   ];
 
   return tests.map((t) => {

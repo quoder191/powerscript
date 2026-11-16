@@ -1,7 +1,9 @@
 import { BROWSER_STDLIB_SOURCE } from './browser.ts';
 import { CORE_STDLIB_SOURCE } from './core.ts';
+import { MODULES_STDLIB_SOURCE } from './modules.ts';
 import { STACK_LIBRARY_SOURCE } from './stack.ts';
 import { SYSTEM_STDLIB_SOURCE } from './system.ts';
+import { YOURGUI_STDLIB_SOURCE } from './yourgui/index.ts';
 
 export function buildRuntimePrelude(): string {
   return `// EasyJS Modular Standard Library Prelude (Core · Browser · System · Stack)
@@ -15,6 +17,13 @@ const __ejs = (() => {
     if (typeof v === "object" && v.__ptrKind) {
       if (!v.alive) return \`<\${v.__ptrKind} \${v.name}: dropped>\`;
       if (v.moved) return \`<\${v.__ptrKind} \${v.name}: moved>\`;
+      if (v.__ptrKind === "ptr") {
+        const cur = typeof v.get === "function" ? v.get() : v.value;
+        return \`<ptr \${v.name} @ \${v.addr}: \${formatVal(cur)}>\`;
+      }
+      if (v.__ptrKind === "weak") {
+        return v.expired() ? \`<weak_ptr \${v.name}: expired>\` : \`<weak_ptr \${v.name}: \${formatVal(v.target.value)}>\`;
+      }
       return \`<\${v.__ptrKind} \${v.name}: \${formatVal(v.__ptrKind === 'ref' ? v.target.value : v.value)}>\`;
     }
     if (typeof v === "object" && v.__enumTag) {
@@ -89,11 +98,21 @@ ${CORE_STDLIB_SOURCE}
 ${BROWSER_STDLIB_SOURCE}
 ${SYSTEM_STDLIB_SOURCE}
 ${STACK_LIBRARY_SOURCE}
+${YOURGUI_STDLIB_SOURCE}
+${MODULES_STDLIB_SOURCE}
 
   const callMethod = (obj, method, args = [], optional = false) => {
     if (obj === null || obj === undefined) {
       if (optional) return undefined;
       throw new Error(\`NullPointerError: Cannot call '.\${method}()' on null\`);
+    }
+
+    // Pointer deref method delegation for ptr->method()
+    if (typeof obj === "object" && obj.__ptrKind) {
+      if (typeof obj[method] === "function") {
+        return obj[method](...args);
+      }
+      return callMethod(deref(obj), method, args, optional);
     }
 
     // Preserve \`this\` on class instances, structs, Stack, Queue, or namespace objects (like stackLib)
@@ -328,11 +347,20 @@ ${STACK_LIBRARY_SOURCE}
 
   return {
     pointerEvents,
+    visualOutputs,
+    registeredRoutes,
     cleanupTimers,
     call: callMethod,
     iter,
     has: hasMember,
+    loadModule,
     stack: stackLib,
+    db: dbLib,
+    server: serverLib,
+    ui: uiLib,
+    http: httpLib,
+    pkg: pkgLib,
+    yourgui: yourguiLib,
     Stack: StackCtor,
     Queue: QueueCtor,
     Dict: (init) => ({ ...(init || {}) }),
@@ -434,10 +462,30 @@ ${STACK_LIBRARY_SOURCE}
     random: randomNum,
     randInt: (lo, hi) => randomNum(lo, hi),
 
-    // Browser & Interactive
+    // Extra utility helpers
+    slugify: (s) => String(s).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+    capitalize: (s) => {
+      const str = String(s);
+      return str ? str.charAt(0).toUpperCase() + str.slice(1) : "";
+    },
+    truncate: (s, maxLen = 40) => {
+      const str = String(s);
+      return str.length > maxLen ? str.slice(0, maxLen - 3) + "..." : str;
+    },
+    chunk: (arr, size = 2) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += Math.max(1, size)) out.push(arr.slice(i, i + Math.max(1, size)));
+      return out;
+    },
+    zip: (a, b) => a.map((v, i) => [v, b[i] ?? null]),
+    deepClone: (v) => JSON.parse(JSON.stringify(v)),
+    formatCurrency: (n, symbol = "$") => \`\${symbol}\${Number(n).toFixed(2)}\`,
+    percent: (part, total) => (total === 0 ? "0%" : \`\${((part / total) * 100).toFixed(1)}%\`),
+
+    // Browser & Interactive (exact JS popup semantics for alert/confirm/prompt)
     input: (promptText = "") => readInputRaw(promptText),
     ask: (promptText = "") => readInputRaw(promptText),
-    prompt: (promptText = "") => readInputRaw(promptText),
+    prompt: (promptText = "", defaultValue = "") => browserPrompt(promptText, defaultValue),
     inputInt: (promptText = "") => {
       const raw = readInputRaw(promptText);
       if (raw && typeof raw.then === "function") return raw.then(toInt);
@@ -448,13 +496,8 @@ ${STACK_LIBRARY_SOURCE}
       if (raw && typeof raw.then === "function") return raw.then(toFloat);
       return toFloat(raw);
     },
-    confirm: (promptText = "") => {
-      const parseBool = (v) => ["y", "yes", "true", "1"].includes(String(v).trim().toLowerCase());
-      const raw = readInputRaw(promptText);
-      if (raw && typeof raw.then === "function") return raw.then(parseBool);
-      return parseBool(raw);
-    },
-    alert: browserAlert,
+    confirm: (promptText = "") => browserConfirm(promptText),
+    alert: (msg = "") => browserAlert(msg),
     browser: browserOpen,
     copy: copyText,
     speak: speakText,
@@ -477,97 +520,488 @@ ${STACK_LIBRARY_SOURCE}
     writeFile: writeFileVfs,
     deleteFile: deleteFileVfs,
 
-    // Smart & Rule Pointers
-    own: (value, name = "own") => {
-      const cell = { __ptrKind: "own", name, value, alive: true, moved: false };
-      pointerEvents.push({ op: "own", name, state: "active", detail: formatVal(value) });
-      return cell;
-    },
-    move: (ptr, newName = "moved") => {
-      if (!ptr || ptr.__ptrKind !== "own") return ptr;
-      if (!ptr.alive) throw new Error(\`RuntimeRuleError: Cannot move dropped pointer '\${ptr.name}'\`);
-      if (ptr.moved) throw new Error(\`RuntimeRuleError: Cannot move '\${ptr.name}' twice\`);
-      const val = ptr.value;
-      ptr.moved = true;
-      ptr.value = undefined;
-      pointerEvents.push({ op: "move", name: ptr.name, state: "moved", detail: \`-> \${newName}\` });
-      return { __ptrKind: "own", name: newName, value: val, alive: true, moved: false };
-    },
-    borrow: (target, name = "ref") => {
-      if (target && target.__ptrKind) {
-        if (!target.alive) throw new Error(\`RuntimeRuleError: Cannot borrow dropped pointer '\${target.name}'\`);
-        if (target.moved) throw new Error(\`RuntimeRuleError: Cannot borrow moved pointer '\${target.name}'\`);
-        const cell = { __ptrKind: "ref", name, target, alive: true, moved: false };
-        pointerEvents.push({ op: "borrow", name, state: "borrowed", detail: \`-> \${target.name}\` });
-        return cell;
-      }
-      const box = { __ptrKind: "own", name: "target", value: target, alive: true, moved: false };
-      return { __ptrKind: "ref", name, target: box, alive: true, moved: false };
-    },
-    share: (value, name = "shared") => {
-      const cell = {
-        __ptrKind: "shared",
-        name,
-        value,
-        alive: true,
-        moved: false,
-        refCount: 1,
-        clone() {
-          if (!this.alive) throw new Error(\`RuntimeRuleError: Cannot clone dropped shared pointer '\${this.name}'\`);
-          this.refCount += 1;
-          pointerEvents.push({ op: "clone", name: this.name, state: "active", detail: \`refCount=\${this.refCount}\` });
-          return this;
-        },
-        count() {
-          return this.refCount;
-        },
+    // Smart, C++ & Rule Pointers + Memory Management
+    ...(() => {
+      let nextAddr = 0x1000;
+      const nextHexAddr = () => {
+        nextAddr += 8;
+        return "0x7ff" + nextAddr.toString(16).padStart(8, "0");
       };
-      pointerEvents.push({ op: "shared", name, state: "active", detail: "refCount=1" });
-      return cell;
-    },
-    deref: (ptr) => {
-      if (!ptr || !ptr.__ptrKind) return ptr;
-      if (ptr.__ptrKind === "ref") {
-        if (!ptr.target.alive) throw new Error(\`RuntimeRuleError: Dangling borrow '\${ptr.name}' (owner dropped)\`);
-        if (ptr.target.moved) throw new Error(\`RuntimeRuleError: Dangling borrow '\${ptr.name}' (owner moved)\`);
-        return ptr.target.value;
-      }
-      if (!ptr.alive) throw new Error(\`RuntimeRuleError: Dereference of dropped pointer '\${ptr.name}'\`);
-      if (ptr.moved) throw new Error(\`RuntimeRuleError: Dereference of moved pointer '\${ptr.name}'\`);
-      return ptr.value;
-    },
-    setDeref: (ptr, val) => {
-      if (!ptr || !ptr.__ptrKind) throw new Error("RuntimeRuleError: Cannot dereference-assign non-pointer");
-      if (ptr.__ptrKind === "ref") throw new Error(\`RuntimeRuleError: Cannot mutate through immutable rule reference '\${ptr.name}'\`);
-      if (!ptr.alive) throw new Error(\`RuntimeRuleError: Write to dropped pointer '\${ptr.name}'\`);
-      if (ptr.moved) throw new Error(\`RuntimeRuleError: Write to moved pointer '\${ptr.name}'\`);
-      ptr.value = val;
-      return val;
-    },
-    drop: (ptr) => {
-      if (!ptr || !ptr.__ptrKind) return null;
-      if (ptr.__ptrKind === "shared") {
-        ptr.refCount = Math.max(0, ptr.refCount - 1);
-        if (ptr.refCount === 0) {
-          ptr.alive = false;
-          ptr.value = undefined;
+
+      const browserLocation = () => {
+        const loc = typeof globalThis !== "undefined" && globalThis.location ? globalThis.location : null;
+        return {
+          href: loc ? String(loc.href || "about:blank") : "about:blank",
+          pathname: loc ? String(loc.pathname || "/") : "/",
+          hostname: loc ? String(loc.hostname || "localhost") : "localhost",
+          origin: loc ? String(loc.origin || "null") : "null",
+          protocol: loc ? String(loc.protocol || "http:") : "http:",
+          search: loc ? String(loc.search || "") : "",
+          hash: loc ? String(loc.hash || "") : "",
+        };
+      };
+
+      const wrapPtrProxy = (cell) => {
+        const proxy = new Proxy(cell, {
+          get(target, prop) {
+            if (prop === Symbol.toPrimitive) return () => target.addr || formatVal(proxy);
+            if (prop === "__rawCell") return target;
+            if (prop === "addr" || prop === "address") return target.addr;
+            if (prop === "location") return browserLocation();
+            if (prop === "value") return target.get();
+            if (prop in target) {
+              const val = target[prop];
+              return typeof val === "function" ? val.bind(target) : val;
+            }
+            if (typeof prop === "string" && /^[0-9]+$/.test(prop)) {
+              const idx = Number(prop);
+              if (!target.alive) throw new Error(\`NullPointerError: Dereference of freed/null pointer '\${target.name}'\`);
+              if (target.__heapArray) {
+                const pos = (target.offset || 0) + idx;
+                if (pos < 0 || pos >= target.__heapArray.length) {
+                  throw new Error(\`BoundsError: Heap index \${pos} out of bounds (length \${target.__heapArray.length})\`);
+                }
+                return target.__heapArray[pos];
+              }
+              const cur = target.get();
+              if (Array.isArray(cur) || typeof cur === "string") return cur[idx];
+              if (idx === 0) return cur;
+              return undefined;
+            }
+            const cur = target.get();
+            if (cur !== null && cur !== undefined && (typeof cur === "object" || typeof cur === "string")) {
+              const member = cur[prop];
+              return typeof member === "function" ? member.bind(cur) : member;
+            }
+            return undefined;
+          },
+          set(target, prop, val) {
+            if (prop === "value") {
+              target.set(val);
+              return true;
+            }
+            if (typeof prop === "string" && /^[0-9]+$/.test(prop)) {
+              const idx = Number(prop);
+              if (!target.alive) throw new Error(\`NullPointerError: Write to freed/null pointer '\${target.name}'\`);
+              if (target.isConst) throw new Error(\`RuntimeRuleError: Cannot modify value through const pointer '\${target.name}'\`);
+              if (target.__heapArray) {
+                const pos = (target.offset || 0) + idx;
+                if (pos < 0 || pos >= target.__heapArray.length) {
+                  throw new Error(\`BoundsError: Heap index \${pos} out of bounds (length \${target.__heapArray.length})\`);
+                }
+                target.__heapArray[pos] = val;
+                return true;
+              }
+              const cur = target.get();
+              if (Array.isArray(cur)) {
+                cur[idx] = val;
+                return true;
+              }
+              if (idx === 0) {
+                target.set(val);
+                return true;
+              }
+              return false;
+            }
+            if (prop in target) {
+              target[prop] = val;
+              return true;
+            }
+            if (!target.alive) throw new Error(\`NullPointerError: Member write on freed pointer '\${target.name}'\`);
+            if (target.isConst) throw new Error(\`RuntimeRuleError: Cannot modify field through const pointer '\${target.name}'\`);
+            const cur = target.get();
+            if (cur && typeof cur === "object") {
+              cur[prop] = val;
+              return true;
+            }
+            return false;
+          },
+        });
+        return proxy;
+      };
+
+      const addrOf = (getter, setter, name = "ptr", isConst = false) => {
+        const addr = nextHexAddr();
+        const cell = {
+          __ptrKind: "ptr",
+          name,
+          addr,
+          alive: true,
+          moved: false,
+          isConst,
+          offset: 0,
+          get() {
+            if (!this.alive) throw new Error(\`NullPointerError: Dereference of freed/null pointer '\${this.name}'\`);
+            if (this.moved) throw new Error(\`RuntimeRuleError: Dereference of moved pointer '\${this.name}'\`);
+            return getter();
+          },
+          set(v) {
+            if (!this.alive) throw new Error(\`NullPointerError: Write to freed/null pointer '\${this.name}'\`);
+            if (this.isConst) throw new Error(\`RuntimeRuleError: Cannot modify value through const pointer '\${this.name}'\`);
+            if (!setter) throw new Error(\`RuntimeRuleError: Pointer '\${this.name}' has no mutable backing target\`);
+            setter(v);
+            return v;
+          },
+          toString() { return \`<ptr \${this.name} @ \${this.addr}: \${formatVal(this.get())}>\`; },
+        };
+        pointerEvents.push({ op: "addr", name, state: "active", detail: addr });
+        return wrapPtrProxy(cell);
+      };
+
+      const addressOf = (target, name = "addr") => {
+        if (target && typeof target === "object" && target.__ptrKind) return target;
+        let box = target;
+        return addrOf(() => box, (v) => { box = v; }, name, false);
+      };
+
+      const allocSingle = (val = null, typeName = "T") => {
+        const addr = nextHexAddr();
+        const cell = {
+          __ptrKind: "ptr",
+          __heapAllocated: true,
+          __typeName: typeName,
+          name: \`heap<\${typeName}>\`,
+          addr,
+          alive: true,
+          moved: false,
+          isConst: false,
+          value: val,
+          get() {
+            if (!this.alive) throw new Error(\`NullPointerError: Use after delete on '\${this.name}'\`);
+            return this.value;
+          },
+          set(v) {
+            if (!this.alive) throw new Error(\`NullPointerError: Write after delete on '\${this.name}'\`);
+            this.value = v;
+            return v;
+          },
+          free() {
+            if (!this.alive) throw new Error(\`RuntimeRuleError: Double delete on '\${this.name}'\`);
+            this.alive = false;
+            this.value = undefined;
+          },
+          toString() { return \`<heap \${this.name} @ \${this.addr}: \${this.alive ? formatVal(this.value) : "deleted"}>\`; },
+        };
+        pointerEvents.push({ op: "new", name: cell.name, state: "active", detail: addr });
+        return wrapPtrProxy(cell);
+      };
+
+      const allocArray = (count, typeName = "T") => {
+        const n = Math.max(0, Math.trunc(Number(count) || 0));
+        const fill = ["int", "float", "number", "double", "long", "short"].includes(typeName)
+          ? 0
+          : ["str", "string", "text"].includes(typeName)
+            ? ""
+            : typeName === "bool" || typeName === "boolean"
+              ? false
+              : null;
+        const buf = Array.from({ length: n }, () => fill);
+        const addr = nextHexAddr();
+        const makeSlice = (offset) => {
+          const cell = {
+            __ptrKind: "ptr",
+            __heapAllocated: true,
+            __isArray: true,
+            __heapArray: buf,
+            __typeName: typeName,
+            offset,
+            name: \`heap<\${typeName}[\${n}]>\`,
+            addr,
+            alive: true,
+            moved: false,
+            isConst: false,
+            get() {
+              if (!this.alive) throw new Error(\`NullPointerError: Use after delete[] on '\${this.name}'\`);
+              return this.__heapArray[this.offset];
+            },
+            set(v) {
+              if (!this.alive) throw new Error(\`NullPointerError: Write after delete[] on '\${this.name}'\`);
+              this.__heapArray[this.offset] = v;
+              return v;
+            },
+            offsetPtr(delta) {
+              return makeSlice(this.offset + Math.trunc(Number(delta) || 0));
+            },
+            free() {
+              if (!this.alive) throw new Error(\`RuntimeRuleError: Double delete[] on '\${this.name}'\`);
+              this.alive = false;
+              this.__heapArray.length = 0;
+            },
+            toString() { return \`<array_ptr \${this.name}[\${this.offset}] @ \${this.addr}>\`; },
+          };
+          return wrapPtrProxy(cell);
+        };
+        pointerEvents.push({ op: "new[]", name: \`heap<\${typeName}[\${n}]>\`, state: "active", detail: addr });
+        return makeSlice(0);
+      };
+
+      const ptrAdd = (p, delta) => {
+        if (p && typeof p === "object" && p.__ptrKind === "ptr" && typeof p.offsetPtr === "function") {
+          return p.offsetPtr(delta);
         }
-        pointerEvents.push({ op: "drop", name: ptr.name, state: ptr.alive ? "active" : "dropped", detail: \`refCount=\${ptr.refCount}\` });
+        return p + delta;
+      };
+
+      const sizeof = (vOrType) => {
+        if (typeof vOrType === "string") {
+          if (vOrType.includes("*") || vOrType.includes("&")) return 8;
+          switch (vOrType) {
+            case "bool": case "boolean": case "char": return 1;
+            case "short": return 2;
+            case "int": case "float": return 4;
+            case "double": case "long": case "number": case "ptr": return 8;
+            case "str": case "string": case "text": return 24;
+            default: return 8;
+          }
+        }
+        if (vOrType === null || vOrType === undefined) return 8;
+        if (typeof vOrType === "boolean") return 1;
+        if (typeof vOrType === "number") return Number.isInteger(vOrType) ? 4 : 8;
+        if (typeof vOrType === "string") return vOrType.length;
+        if (Array.isArray(vOrType)) return vOrType.length * 8;
+        if (typeof vOrType === "object") {
+          if (vOrType.__heapArray) return vOrType.__heapArray.length * 8;
+          if (vOrType.__ptrKind) return 8;
+          return Object.keys(vOrType).length * 8;
+        }
+        return 8;
+      };
+
+      const makeUnique = (val, name = "unique_ptr") => {
+        const addr = nextHexAddr();
+        const cell = {
+          __ptrKind: "unique",
+          name,
+          addr,
+          value: val,
+          alive: true,
+          moved: false,
+          get() {
+            if (!this.alive) throw new Error(\`NullPointerError: Dereference of reset/deleted unique_ptr '\${this.name}'\`);
+            if (this.moved) throw new Error(\`RuntimeRuleError: Use of moved unique_ptr '\${this.name}'\`);
+            return this.value;
+          },
+          set(v) {
+            if (!this.alive || this.moved) throw new Error(\`RuntimeRuleError: Invalid write on unique_ptr '\${this.name}'\`);
+            this.value = v;
+            return v;
+          },
+          release() {
+            const out = this.value;
+            this.value = null;
+            this.alive = false;
+            return out;
+          },
+          reset(nextVal) {
+            if (nextVal === undefined) {
+              this.alive = false;
+              this.value = undefined;
+            } else {
+              this.alive = true;
+              this.moved = false;
+              this.value = nextVal;
+            }
+          },
+        };
+        pointerEvents.push({ op: "unique_ptr", name, state: "active", detail: addr });
+        return wrapPtrProxy(cell);
+      };
+
+      const own = (value, name = "own") => {
+        const cell = { __ptrKind: "own", name, value, alive: true, moved: false };
+        pointerEvents.push({ op: "own", name, state: "active", detail: formatVal(value) });
+        return cell;
+      };
+
+      const move = (ptr, newName = "moved") => {
+        if (!ptr || !ptr.__ptrKind) return ptr;
+        if (ptr.__ptrKind !== "own" && ptr.__ptrKind !== "unique") return ptr;
+        const raw = ptr.__rawCell || ptr;
+        if (!raw.alive) throw new Error(\`RuntimeRuleError: Cannot move dropped pointer '\${raw.name}'\`);
+        if (raw.moved) throw new Error(\`RuntimeRuleError: Cannot move '\${raw.name}' twice\`);
+        const val = raw.value;
+        raw.moved = true;
+        raw.value = undefined;
+        pointerEvents.push({ op: "move", name: raw.name, state: "moved", detail: \`-> \${newName}\` });
+        return ptr.__ptrKind === "unique" ? makeUnique(val, newName) : { __ptrKind: "own", name: newName, value: val, alive: true, moved: false };
+      };
+
+      const borrow = (target, name = "ref") => {
+        if (target && target.__ptrKind) {
+          if (!target.alive) throw new Error(\`RuntimeRuleError: Cannot borrow dropped pointer '\${target.name}'\`);
+          if (target.moved) throw new Error(\`RuntimeRuleError: Cannot borrow moved pointer '\${target.name}'\`);
+          const cell = { __ptrKind: "ref", name, target, alive: true, moved: false };
+          pointerEvents.push({ op: "borrow", name, state: "borrowed", detail: \`-> \${target.name}\` });
+          return cell;
+        }
+        const box = { __ptrKind: "own", name: "target", value: target, alive: true, moved: false };
+        return { __ptrKind: "ref", name, target: box, alive: true, moved: false };
+      };
+
+      const share = (value, name = "shared") => {
+        const addr = nextHexAddr();
+        const cell = {
+          __ptrKind: "shared",
+          name,
+          addr,
+          value,
+          alive: true,
+          moved: false,
+          refCount: 1,
+          get() {
+            if (!this.alive) throw new Error(\`NullPointerError: Dereference of released shared_ptr '\${this.name}'\`);
+            return this.value;
+          },
+          set(v) {
+            if (!this.alive) throw new Error(\`NullPointerError: Write to released shared_ptr '\${this.name}'\`);
+            this.value = v;
+            return v;
+          },
+          clone() {
+            if (!this.alive) throw new Error(\`RuntimeRuleError: Cannot clone dropped shared pointer '\${this.name}'\`);
+            this.refCount += 1;
+            pointerEvents.push({ op: "clone", name: this.name, state: "active", detail: \`refCount=\${this.refCount}\` });
+            return proxy;
+          },
+          count() {
+            return this.refCount;
+          },
+          use_count() {
+            return this.refCount;
+          },
+          reset() {
+            drop(proxy);
+          },
+        };
+        const proxy = wrapPtrProxy(cell);
+        pointerEvents.push({ op: "shared", name, state: "active", detail: "refCount=1" });
+        return proxy;
+      };
+
+      const makeWeak = (sharedPtr, name = "weak_ptr") => {
+        const target = sharedPtr && sharedPtr.__rawCell ? sharedPtr.__rawCell : sharedPtr;
+        const cell = {
+          __ptrKind: "weak",
+          name,
+          target,
+          alive: true,
+          moved: false,
+          expired() {
+            return !this.alive || !this.target || !this.target.alive || this.target.refCount <= 0;
+          },
+          use_count() {
+            return this.expired() ? 0 : this.target.refCount;
+          },
+          lock() {
+            if (this.expired()) return null;
+            return this.target.clone ? this.target.clone() : sharedPtr;
+          },
+          reset() {
+            this.alive = false;
+            this.target = null;
+          },
+        };
+        pointerEvents.push({ op: "weak_ptr", name, state: "active", detail: target ? \`-> \${target.name}\` : "empty" });
+        return cell;
+      };
+
+      const deref = (ptr) => {
+        if (!ptr || !ptr.__ptrKind) return ptr;
+        if (ptr.__ptrKind === "ref") {
+          if (!ptr.target.alive) throw new Error(\`RuntimeRuleError: Dangling borrow '\${ptr.name}' (owner dropped)\`);
+          if (ptr.target.moved) throw new Error(\`RuntimeRuleError: Dangling borrow '\${ptr.name}' (owner moved)\`);
+          return ptr.target.value;
+        }
+        if (ptr.__ptrKind === "ptr" || ptr.__ptrKind === "unique") {
+          return ptr.get();
+        }
+        if (!ptr.alive) throw new Error(\`RuntimeRuleError: Dereference of dropped pointer '\${ptr.name}'\`);
+        if (ptr.moved) throw new Error(\`RuntimeRuleError: Dereference of moved pointer '\${ptr.name}'\`);
+        return ptr.value;
+      };
+
+      const setDeref = (ptr, val) => {
+        if (!ptr || !ptr.__ptrKind) throw new Error("RuntimeRuleError: Cannot dereference-assign non-pointer");
+        if (ptr.__ptrKind === "ref") throw new Error(\`RuntimeRuleError: Cannot mutate through immutable rule reference '\${ptr.name}'\`);
+        if (ptr.__ptrKind === "ptr" || ptr.__ptrKind === "unique") {
+          ptr.set(val);
+          return val;
+        }
+        const raw = ptr.__rawCell || ptr;
+        if (!raw.alive) throw new Error(\`RuntimeRuleError: Write to dropped pointer '\${raw.name}'\`);
+        if (raw.moved) throw new Error(\`RuntimeRuleError: Write to moved pointer '\${raw.name}'\`);
+        raw.value = val;
+        return val;
+      };
+
+      const drop = (ptr, isArrayDelete = false) => {
+        if (!ptr || !ptr.__ptrKind) return null;
+        const raw = ptr.__rawCell || ptr;
+        if (raw.__ptrKind === "shared") {
+          raw.refCount = Math.max(0, raw.refCount - 1);
+          if (raw.refCount === 0) {
+            raw.alive = false;
+            raw.value = undefined;
+          }
+          pointerEvents.push({ op: "drop", name: raw.name, state: raw.alive ? "active" : "dropped", detail: \`refCount=\${raw.refCount}\` });
+          return null;
+        }
+        if (raw.__ptrKind === "ptr") {
+          if (!raw.alive) throw new Error(\`RuntimeRuleError: Double delete on '\${raw.name}'\`);
+          if (typeof raw.free === "function") {
+            raw.free();
+          } else {
+            raw.alive = false;
+          }
+          pointerEvents.push({ op: isArrayDelete ? "delete[]" : "delete", name: raw.name, state: "dropped", detail: raw.addr || "freed" });
+          return null;
+        }
+        if (!raw.alive) throw new Error(\`RuntimeRuleError: Double drop on '\${raw.name}'\`);
+        raw.alive = false;
+        raw.value = undefined;
+        pointerEvents.push({ op: "drop", name: raw.name, state: "dropped", detail: "released" });
         return null;
-      }
-      if (!ptr.alive) throw new Error(\`RuntimeRuleError: Double drop on '\${ptr.name}'\`);
-      ptr.alive = false;
-      ptr.value = undefined;
-      pointerEvents.push({ op: "drop", name: ptr.name, state: "dropped", detail: "released" });
-      return null;
-    },
-    refCount: (ptr) => (ptr && ptr.__ptrKind === "shared" ? ptr.refCount : ptr && ptr.alive ? 1 : 0),
-    matchEnum: (subject, enumName, variant) =>
-      Boolean(subject && subject.__enumTag === variant && (!enumName || subject.__enumName === enumName)),
+      };
+
+      return {
+        own,
+        move,
+        borrow,
+        share,
+        deref,
+        setDeref,
+        drop,
+        addrOf,
+        addressOf,
+        addr: addressOf,
+        allocSingle,
+        allocArray,
+        ptrAdd,
+        sizeof,
+        browserLocation,
+        location: browserLocation(),
+        NULL: null,
+        make_unique: makeUnique,
+        unique_ptr: makeUnique,
+        make_shared: share,
+        shared_ptr: share,
+        weak_ptr: makeWeak,
+        refCount: (ptr) => {
+          if (!ptr) return 0;
+          const raw = ptr.__rawCell || ptr;
+          if (raw.__ptrKind === "shared") return raw.refCount;
+          if (raw.__ptrKind === "weak") return raw.use_count();
+          return raw.alive ? 1 : 0;
+        },
+        matchEnum: (subject, enumName, variant) =>
+          Boolean(subject && subject.__enumTag === variant && (!enumName || subject.__enumName === enumName)),
+      };
+    })(),
   };
 })();
 const {
-  stack, Stack, Queue, Dict, List, Set: EjsSet,
+  stack, db, server, ui, http, pkg, yourgui,
+  Stack, Queue, Dict, List, Set: EjsSet,
   print, println, write, input, ask, prompt, inputInt, inputFloat, confirm, alert,
   browser, copy, speak, listen, fetch,
   sleep, time, date, timer, interval, stop, exit, download, readFile, writeFile, deleteFile,
@@ -576,9 +1010,17 @@ const {
   uppercase, upper, lowercase, lower, trim, split, join, replace, reverse, contains,
   append, push, pop, remove, sort, shuffle, find, filter, unique, first, last,
   keys, values, entries, map, reduce, sum, avg, take,
+  slugify, capitalize, truncate, chunk, zip, deepClone, formatCurrency, percent,
   abs, round, floor, ceil, sqrt, pow, min, max, clamp, random, randInt,
-  refCount
+  refCount, make_unique, make_shared, unique_ptr, shared_ptr, weak_ptr,
+  sizeof, addressOf, addr, browserLocation, NULL
 } = __ejs;
+const {
+  button, text, heading, image, link, textarea, checkbox, radio,
+  video, audio, select, option, section, container, line, row, column, grid, form,
+  dom, byId, getById, selectId, render, mount,
+  onClick, onInput, onChange, onSubmit, click
+} = yourgui;
 const share = (v) => __ejs.share(v);
 const own = (v) => __ejs.own(v);
 const drop = (p) => __ejs.drop(p);

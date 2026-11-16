@@ -1,6 +1,6 @@
 export type Visibility = 'pub' | 'priv' | 'prot';
 
-export type PointerMode = 'own' | 'ref' | 'shared';
+export type PointerMode = 'own' | 'ref' | 'shared' | 'ptr' | 'cpp_ref' | 'unique' | 'weak';
 
 export interface SourcePosition {
   line: number;
@@ -12,6 +12,11 @@ export interface TypeAnnotationNode extends SourcePosition {
   name: string;
   generics: TypeAnnotationNode[];
   nullable: boolean;
+  unionTypes?: TypeAnnotationNode[];
+  isPointer?: number;
+  isReference?: boolean;
+  isConst?: boolean;
+  isConstPointer?: boolean;
 }
 
 export interface ParamNode extends SourcePosition {
@@ -27,17 +32,21 @@ export interface ParamNode extends SourcePosition {
 
 export type StatementNode =
   | VarDeclarationNode
+  | MultiVarDeclarationNode
   | FunctionDeclarationNode
   | ClassDeclarationNode
   | StructDeclarationNode
   | EnumDeclarationNode
   | TraitDeclarationNode
+  | ImportStatementNode
   | BlockStatementNode
   | IfStatementNode
   | ForInStatementNode
   | CForStatementNode
   | WhileStatementNode
+  | DoWhileStatementNode
   | LoopStatementNode
+  | RepeatStatementNode
   | ReturnStatementNode
   | BreakStatementNode
   | ContinueStatementNode
@@ -46,6 +55,7 @@ export type StatementNode =
   | DeferStatementNode
   | DropStatementNode
   | ScopeStatementNode
+  | StyleStatementNode
   | ExpressionStatementNode;
 
 export interface ProgramNode extends SourcePosition {
@@ -62,9 +72,24 @@ export interface VarDeclarationNode extends SourcePosition {
   initializer?: ExpressionNode;
 }
 
+export interface MultiVarDeclarationNode extends SourcePosition {
+  kind: 'MultiVarDeclaration';
+  mutable: boolean;
+  declarations: VarDeclarationNode[];
+}
+
+export interface ImportStatementNode extends SourcePosition {
+  kind: 'ImportStatement';
+  modulePath: string;
+  defaultImport?: string;
+  namedImports: string[];
+  alias?: string;
+}
+
 export interface FunctionDeclarationNode extends SourcePosition {
   kind: 'FunctionDeclaration';
   name: string;
+  genericParams?: string[];
   params: ParamNode[];
   returnType?: TypeAnnotationNode;
   body: BlockStatementNode;
@@ -95,6 +120,7 @@ export interface ClassMethodNode extends SourcePosition {
 export interface ClassDeclarationNode extends SourcePosition {
   kind: 'ClassDeclaration';
   name: string;
+  genericParams?: string[];
   superClass?: string;
   traits: string[];
   fields: ClassFieldNode[];
@@ -111,6 +137,7 @@ export interface StructFieldNode extends SourcePosition {
 export interface StructDeclarationNode extends SourcePosition {
   kind: 'StructDeclaration';
   name: string;
+  genericParams?: string[];
   fields: StructFieldNode[];
   methods: ClassMethodNode[];
 }
@@ -137,6 +164,7 @@ export interface TraitMethodSignatureNode extends SourcePosition {
 export interface TraitDeclarationNode extends SourcePosition {
   kind: 'TraitDeclaration';
   name: string;
+  genericParams?: string[];
   methods: TraitMethodSignatureNode[];
 }
 
@@ -179,8 +207,20 @@ export interface WhileStatementNode extends SourcePosition {
   body: BlockStatementNode;
 }
 
+export interface DoWhileStatementNode extends SourcePosition {
+  kind: 'DoWhileStatement';
+  body: BlockStatementNode;
+  condition: ExpressionNode;
+}
+
 export interface LoopStatementNode extends SourcePosition {
   kind: 'LoopStatement';
+  body: BlockStatementNode;
+}
+
+export interface RepeatStatementNode extends SourcePosition {
+  kind: 'RepeatStatement';
+  count: ExpressionNode;
   body: BlockStatementNode;
 }
 
@@ -217,12 +257,18 @@ export interface DeferStatementNode extends SourcePosition {
 export interface DropStatementNode extends SourcePosition {
   kind: 'DropStatement';
   target: ExpressionNode;
+  isArrayDelete?: boolean;
 }
 
 export interface ScopeStatementNode extends SourcePosition {
   kind: 'ScopeStatement';
   name?: string;
   body: BlockStatementNode;
+}
+
+export interface StyleStatementNode extends SourcePosition {
+  kind: 'StyleStatement';
+  css: string;
 }
 
 export interface ExpressionStatementNode extends SourcePosition {
@@ -246,6 +292,7 @@ export type ExpressionNode =
   | UnaryExpressionNode
   | UpdateExpressionNode
   | LogicalExpressionNode
+  | ConditionalExpressionNode
   | AssignmentExpressionNode
   | CallExpressionNode
   | MemberExpressionNode
@@ -257,6 +304,13 @@ export type ExpressionNode =
   | PipeExpressionNode
   | MatchExpressionNode
   | PointerExpressionNode;
+
+export interface ConditionalExpressionNode extends SourcePosition {
+  kind: 'ConditionalExpression';
+  condition: ExpressionNode;
+  consequent: ExpressionNode;
+  alternate: ExpressionNode;
+}
 
 export interface IdentifierNode extends SourcePosition {
   kind: 'Identifier';
@@ -367,6 +421,7 @@ export interface NewExpressionNode extends SourcePosition {
   kind: 'NewExpression';
   className: string;
   args: ExpressionNode[];
+  countExpr?: ExpressionNode;
 }
 
 export interface StructInitField {
@@ -419,6 +474,7 @@ export interface MatchExpressionNode extends SourcePosition {
 
 export interface PointerExpressionNode extends SourcePosition {
   kind: 'PointerExpression';
-  op: 'own' | 'shared' | 'borrow' | 'move' | 'deref';
+  op: 'own' | 'shared' | 'borrow' | 'move' | 'deref' | 'addr' | 'sizeof';
   argument: ExpressionNode;
+  sizeofTypeName?: string;
 }

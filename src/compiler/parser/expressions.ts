@@ -16,7 +16,7 @@ export function parseExpression(p: Parser): ExpressionNode {
 }
 
 function parseAssignment(p: Parser): ExpressionNode {
-  const expr = parseNullish(p);
+  const expr = parseConditional(p);
 
   if (
     p.match(
@@ -54,6 +54,30 @@ function parseAssignment(p: Parser): ExpressionNode {
   return expr;
 }
 
+function parseConditional(p: Parser): ExpressionNode {
+  const condition = parseNullish(p);
+
+  if (p.match(TokenType.Question)) {
+    const qTok = p.previous();
+    p.skipNewlines();
+    const consequent = parseAssignment(p);
+    p.skipNewlines();
+    p.consume(TokenType.Colon, "Expected ':' in ternary conditional expression.");
+    p.skipNewlines();
+    const alternate = parseAssignment(p);
+    return {
+      kind: 'ConditionalExpression',
+      condition,
+      consequent,
+      alternate,
+      line: qTok.line,
+      column: qTok.column,
+    };
+  }
+
+  return condition;
+}
+
 function parseNullish(p: Parser): ExpressionNode {
   let expr = parsePipe(p);
 
@@ -81,7 +105,7 @@ function parsePipe(p: Parser): ExpressionNode {
     // Allow multiline pipelines:
     // data
     //   |> map(...)
-    if (p.check(TokenType.Newline) && p.peekNonNewline(1).type === TokenType.PipeArrow) {
+    if (p.check(TokenType.Newline) && p.peekNonNewline(0).type === TokenType.PipeArrow) {
       p.skipNewlines();
     }
 
@@ -322,11 +346,39 @@ function parseUnary(p: Parser): ExpressionNode {
     };
   }
 
-  if (p.match(TokenType.Ampersand, TokenType.Borrow)) {
+  if (p.match(TokenType.Power)) {
+    const op = p.previous();
+    return {
+      kind: 'PointerExpression',
+      op: 'deref',
+      argument: {
+        kind: 'PointerExpression',
+        op: 'deref',
+        argument: parseUnary(p),
+        line: op.line,
+        column: op.column + 1,
+      },
+      line: op.line,
+      column: op.column,
+    };
+  }
+
+  if (p.match(TokenType.Borrow)) {
     const op = p.previous();
     return {
       kind: 'PointerExpression',
       op: 'borrow',
+      argument: parseUnary(p),
+      line: op.line,
+      column: op.column,
+    };
+  }
+
+  if (p.match(TokenType.Ampersand)) {
+    const op = p.previous();
+    return {
+      kind: 'PointerExpression',
+      op: 'addr',
       argument: parseUnary(p),
       line: op.line,
       column: op.column,
@@ -393,6 +445,23 @@ function parsePostfix(p: Parser): ExpressionNode {
         line: op.line,
         column: op.column,
       };
+    } else if (p.match(TokenType.Arrow)) {
+      const op = p.previous();
+      const prop = p.consume(TokenType.Identifier, "Expected member name after '->'.");
+      expr = {
+        kind: 'MemberExpression',
+        object: {
+          kind: 'PointerExpression',
+          op: 'deref',
+          argument: expr,
+          line: op.line,
+          column: op.column,
+        },
+        property: prop.lexeme,
+        optional: false,
+        line: op.line,
+        column: op.column,
+      };
     } else if (p.match(TokenType.LeftBracket)) {
       p.skipNewlines();
       const index = parseExpression(p);
@@ -429,10 +498,14 @@ function parseArgumentList(p: Parser): ExpressionNode[] {
 
   if (!p.check(TokenType.RightParen)) {
     do {
+      const startPos = p.getPosition();
       p.skipNewlines();
       if (p.check(TokenType.RightParen)) break;
       args.push(parseExpression(p));
       p.skipNewlines();
+      if (p.getPosition() === startPos && !p.isAtEnd()) {
+        throw p.error(p.peek(), `Unexpected token '${p.peek().lexeme || p.peek().type}' in arguments.`);
+      }
     } while (p.match(TokenType.Comma));
   }
 
@@ -521,8 +594,26 @@ function parsePrimary(p: Parser): ExpressionNode {
 
   if (p.match(TokenType.New)) {
     const tok = p.previous();
-    const className = p.consume(TokenType.Identifier, "Expected class name after 'new'.");
-    p.consume(TokenType.LeftParen, "Expected '(' after class name.");
+    if (p.check(TokenType.Identifier) && p.peek().lexeme === 'std' && p.checkNext(TokenType.DoubleColon)) {
+      p.advance();
+      p.advance();
+    }
+    const className = p.consume(TokenType.Identifier, "Expected type or class name after 'new'.");
+    if (p.match(TokenType.LeftBracket)) {
+      p.skipNewlines();
+      const countExpr = parseExpression(p);
+      p.skipNewlines();
+      p.consume(TokenType.RightBracket, "Expected ']' after array size in 'new'.");
+      return {
+        kind: 'NewExpression',
+        className: className.lexeme,
+        args: [],
+        countExpr,
+        line: tok.line,
+        column: tok.column,
+      };
+    }
+    p.consume(TokenType.LeftParen, "Expected '(' or '[' after type name in 'new'.");
     const args = parseArgumentList(p);
     return {
       kind: 'NewExpression',
@@ -530,6 +621,69 @@ function parsePrimary(p: Parser): ExpressionNode {
       args,
       line: tok.line,
       column: tok.column,
+    };
+  }
+
+  if (p.check(TokenType.Identifier) && p.peek().lexeme === 'sizeof' && p.checkNext(TokenType.LeftParen)) {
+    const tok = p.advance();
+    p.consume(TokenType.LeftParen, "Expected '(' after 'sizeof'.");
+    p.skipNewlines();
+    const peekLex = p.peek().lexeme;
+    const isPlainType =
+      ['int', 'float', 'number', 'str', 'string', 'text', 'bool', 'boolean', 'double', 'char', 'long', 'short', 'auto', 'void', 'ptr'].includes(peekLex) ||
+      (p.check(TokenType.Identifier) && p.checkNext(TokenType.Star));
+    if (isPlainType) {
+      const t = p.parseTypeAnnotation();
+      p.skipNewlines();
+      p.consume(TokenType.RightParen, "Expected ')' after sizeof argument.");
+      const tLabel = `${t.name}${'*'.repeat(t.isPointer ?? 0)}${t.isReference ? '&' : ''}`;
+      return {
+        kind: 'PointerExpression',
+        op: 'sizeof',
+        sizeofTypeName: tLabel,
+        argument: { kind: 'Literal', literalType: 'null', value: null, line: tok.line, column: tok.column },
+        line: tok.line,
+        column: tok.column,
+      };
+    }
+    const arg = parseExpression(p);
+    p.skipNewlines();
+    p.consume(TokenType.RightParen, "Expected ')' after sizeof argument.");
+    return {
+      kind: 'PointerExpression',
+      op: 'sizeof',
+      argument: arg,
+      line: tok.line,
+      column: tok.column,
+    };
+  }
+
+  if (p.check(TokenType.Identifier) && p.peek().lexeme === 'std' && p.checkNext(TokenType.DoubleColon)) {
+    const stdTok = p.advance();
+    p.advance();
+    if (p.match(TokenType.Move)) {
+      p.consume(TokenType.LeftParen, "Expected '(' after 'std::move'.");
+      p.skipNewlines();
+      const arg = parseExpression(p);
+      p.skipNewlines();
+      p.consume(TokenType.RightParen, "Expected ')' after 'std::move' argument.");
+      return {
+        kind: 'PointerExpression',
+        op: 'move',
+        argument: arg,
+        line: stdTok.line,
+        column: stdTok.column,
+      };
+    }
+    const fnTok = p.consume(TokenType.Identifier, "Expected symbol after 'std::'.");
+    if (p.check(TokenType.Less)) {
+      skipOptionalTemplateArgs(p);
+    }
+    return {
+      kind: 'Identifier',
+      name: fnTok.lexeme,
+      line: stdTok.line,
+      column: stdTok.column,
     };
   }
 
@@ -551,6 +705,30 @@ function parsePrimary(p: Parser): ExpressionNode {
 
   if (p.match(TokenType.LeftParen)) {
     const start = p.previous();
+    if (looksLikeArrowParams(p)) {
+      const params = p.parseParamList();
+      p.consume(TokenType.FatArrow, "Expected '=>' after arrow function parameters.");
+      p.skipNewlines();
+      if (p.check(TokenType.LeftBrace) || p.check(TokenType.Colon)) {
+        const body = p.parseBlock();
+        return {
+          kind: 'LambdaExpression',
+          params,
+          body,
+          line: start.line,
+          column: start.column,
+        };
+      }
+      const bodyExpr = parseExpression(p);
+      return {
+        kind: 'LambdaExpression',
+        params,
+        body: bodyExpr,
+        line: start.line,
+        column: start.column,
+      };
+    }
+
     p.skipNewlines();
     const expr = parseExpression(p);
     p.skipNewlines();
@@ -561,8 +739,41 @@ function parsePrimary(p: Parser): ExpressionNode {
   if (p.match(TokenType.Identifier)) {
     const tok = p.previous();
 
+    if (
+      (tok.lexeme === 'make_unique' ||
+        tok.lexeme === 'make_shared' ||
+        tok.lexeme === 'unique_ptr' ||
+        tok.lexeme === 'shared_ptr' ||
+        tok.lexeme === 'weak_ptr') &&
+      p.check(TokenType.Less)
+    ) {
+      skipOptionalTemplateArgs(p);
+    }
+
+    // Support single-identifier arrow function: `x => x * 2` or `x => { ... }`
+    if (p.match(TokenType.FatArrow)) {
+      const param: ParamNode = {
+        kind: 'Param',
+        name: tok.lexeme,
+        line: tok.line,
+        column: tok.column,
+      };
+      p.skipNewlines();
+      const body =
+        p.check(TokenType.LeftBrace) || p.check(TokenType.Colon)
+          ? p.parseBlock()
+          : parseExpression(p);
+      return {
+        kind: 'LambdaExpression',
+        params: [param],
+        body,
+        line: tok.line,
+        column: tok.column,
+      };
+    }
+
     // Support Struct literal syntax: Point { x: 10, y: 20 }
-    if (p.check(TokenType.LeftBrace) && looksLikeStructInit(p)) {
+    if (p.allowStructInit && p.check(TokenType.LeftBrace) && looksLikeStructInit(p)) {
       return parseStructInit(p, tok.lexeme, tok.line, tok.column);
     }
 
@@ -576,6 +787,39 @@ function parsePrimary(p: Parser): ExpressionNode {
 
   const bad = p.peek();
   throw p.error(bad, `Unexpected token '${bad.lexeme || bad.type}' in expression.`);
+}
+
+function skipOptionalTemplateArgs(p: Parser): void {
+  if (!p.match(TokenType.Less)) return;
+  let depth = 1;
+  while (depth > 0 && !p.isAtEnd()) {
+    if (p.match(TokenType.Less)) depth++;
+    else if (p.match(TokenType.Greater)) depth--;
+    else p.advance();
+  }
+}
+
+function looksLikeArrowParams(p: Parser): boolean {
+  let depth = 1;
+  let offset = 0;
+  while (offset < 200) {
+    const tok = p.peekTokenAt(offset);
+    if (tok.type === TokenType.EOF) return false;
+    if (tok.type === TokenType.LeftParen) {
+      depth++;
+    } else if (tok.type === TokenType.RightParen) {
+      depth--;
+      if (depth === 0) {
+        let nextOffset = offset + 1;
+        while (p.peekTokenAt(nextOffset).type === TokenType.Newline) {
+          nextOffset++;
+        }
+        return p.peekTokenAt(nextOffset).type === TokenType.FatArrow;
+      }
+    }
+    offset++;
+  }
+  return false;
 }
 
 function looksLikeStructInit(p: Parser): boolean {
@@ -601,6 +845,7 @@ function parseStructInit(
 
   if (!p.check(TokenType.RightBrace)) {
     do {
+      const startPos = p.getPosition();
       p.skipNewlines();
       if (p.check(TokenType.RightBrace)) break;
       const fieldName = p.consume(TokenType.Identifier, 'Expected struct field name.');
@@ -609,6 +854,9 @@ function parseStructInit(
       const value = parseExpression(p);
       fields.push({ name: fieldName.lexeme, value });
       p.skipNewlines();
+      if (p.getPosition() === startPos && !p.isAtEnd()) {
+        throw p.error(p.peek(), `Unexpected token '${p.peek().lexeme || p.peek().type}' in struct initializer.`);
+      }
     } while (p.match(TokenType.Comma));
   }
 
@@ -643,11 +891,14 @@ function parseLambdaExpression(p: Parser): ExpressionNode {
 
   if (p.match(TokenType.FatArrow)) {
     p.skipNewlines();
-    const bodyExpr = parseExpression(p);
+    const body =
+      p.check(TokenType.LeftBrace) || p.check(TokenType.Colon)
+        ? p.parseBlock()
+        : parseExpression(p);
     return {
       kind: 'LambdaExpression',
       params,
-      body: bodyExpr,
+      body,
       line: start.line,
       column: start.column,
     };
@@ -669,13 +920,21 @@ function parseLambdaExpression(p: Parser): ExpressionNode {
 
 function parseMatchExpression(p: Parser): ExpressionNode {
   const start = p.previous();
-  const subject = parseExpression(p);
+  const prevStructFlag = p.allowStructInit;
+  p.allowStructInit = false;
+  let subject: ExpressionNode;
+  try {
+    subject = parseExpression(p);
+  } finally {
+    p.allowStructInit = prevStructFlag;
+  }
   p.skipNewlines();
   p.consume(TokenType.LeftBrace, "Expected '{' after match subject.");
   p.skipSeparators();
 
   const arms: MatchArmNode[] = [];
   while (!p.check(TokenType.RightBrace) && !p.isAtEnd()) {
+    const startPos = p.getPosition();
     const armStart = p.peek();
     const pattern = parseMatchPattern(p);
     if (!p.match(TokenType.FatArrow, TokenType.Colon)) {
@@ -693,6 +952,9 @@ function parseMatchExpression(p: Parser): ExpressionNode {
     p.skipSeparators();
     if (p.match(TokenType.Comma)) {
       p.skipSeparators();
+    }
+    if (p.getPosition() === startPos && !p.isAtEnd()) {
+      throw p.error(p.peek(), `Unexpected token '${p.peek().lexeme || p.peek().type}' in match expression.`);
     }
   }
 
@@ -783,10 +1045,14 @@ function parseArrayLiteral(p: Parser): ExpressionNode {
 
   if (!p.check(TokenType.RightBracket)) {
     do {
+      const startPos = p.getPosition();
       p.skipNewlines();
       if (p.check(TokenType.RightBracket)) break;
       elements.push(parseExpression(p));
       p.skipNewlines();
+      if (p.getPosition() === startPos && !p.isAtEnd()) {
+        throw p.error(p.peek(), `Unexpected token '${p.peek().lexeme || p.peek().type}' in array literal.`);
+      }
     } while (p.match(TokenType.Comma));
   }
 
@@ -807,6 +1073,7 @@ function parseMapLiteral(p: Parser): ExpressionNode {
 
   if (!p.check(TokenType.RightBrace)) {
     do {
+      const startPos = p.getPosition();
       p.skipNewlines();
       if (p.check(TokenType.RightBrace)) break;
 
@@ -829,6 +1096,9 @@ function parseMapLiteral(p: Parser): ExpressionNode {
       const value = parseExpression(p);
       entries.push({ key, value });
       p.skipNewlines();
+      if (p.getPosition() === startPos && !p.isAtEnd()) {
+        throw p.error(p.peek(), `Unexpected token '${p.peek().lexeme || p.peek().type}' in map literal.`);
+      }
     } while (p.match(TokenType.Comma));
   }
 

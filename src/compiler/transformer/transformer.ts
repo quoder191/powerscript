@@ -9,15 +9,20 @@ import {
   StatementNode,
   StructDeclarationNode,
   TraitDeclarationNode,
+  TypeAnnotationNode,
   VarDeclarationNode,
 } from '../ast/nodes.ts';
 import { CompilerDiagnostic, TransformError } from '../errors/compilerErrors.ts';
+import {
+  YOURGUI_ELEMENT_NAMES,
+  YOURGUI_EVENT_HELPER_NAMES,
+} from '../stdlib/yourgui/index.ts';
 
 export type PointerLifecycle = 'active' | 'moved' | 'dropped' | 'borrowed';
 
 export interface SymbolRecord {
   name: string;
-  kind: 'variable' | 'const' | 'function' | 'class' | 'struct' | 'enum' | 'trait' | 'param';
+  kind: 'variable' | 'const' | 'function' | 'class' | 'struct' | 'enum' | 'trait' | 'param' | 'module';
   mutable: boolean;
   typeName?: string;
   pointerMode?: PointerMode;
@@ -43,6 +48,7 @@ export interface TransformResult {
   pointers: PointerRecord[];
   asyncFunctions: string[];
   topLevelAsync: boolean;
+  refFunctionParams: Record<string, boolean[]>;
 }
 
 const INTERACTIVE_IO_FUNCTIONS = new Set([
@@ -59,9 +65,122 @@ const INTERACTIVE_IO_FUNCTIONS = new Set([
   'copy',
 ]);
 
+const STDLIB_RETURN_TYPES: Record<string, string> = {
+  uppercase: 'string',
+  upper: 'string',
+  lowercase: 'string',
+  lower: 'string',
+  trim: 'string',
+  replace: 'string',
+  join: 'string',
+  toStr: 'string',
+  str: 'string',
+  toText: 'string',
+  date: 'string',
+  time: 'string',
+  readFile: 'string',
+  input: 'string',
+  ask: 'string',
+  prompt: 'string',
+  slugify: 'string',
+  capitalize: 'string',
+  truncate: 'string',
+  formatCurrency: 'string',
+  percent: 'string',
+
+  length: 'int',
+  len: 'int',
+  toInt: 'int',
+  int: 'int',
+  inputInt: 'int',
+  random: 'int',
+  randInt: 'int',
+  round: 'int',
+  floor: 'int',
+  ceil: 'int',
+
+  toFloat: 'float',
+  float: 'float',
+  inputFloat: 'float',
+  sqrt: 'number',
+  abs: 'number',
+  pow: 'number',
+  min: 'number',
+  max: 'number',
+  clamp: 'number',
+  sum: 'number',
+  avg: 'number',
+
+  contains: 'boolean',
+  confirm: 'boolean',
+  writeFile: 'boolean',
+  deleteFile: 'boolean',
+  assert: 'boolean',
+  toBool: 'boolean',
+
+  split: 'array',
+  sort: 'array',
+  shuffle: 'array',
+  filter: 'array',
+  unique: 'array',
+  keys: 'array',
+  values: 'array',
+  entries: 'array',
+  range: 'array',
+  map: 'array',
+  take: 'array',
+  chunk: 'array',
+  zip: 'array',
+
+  Dict: 'dict',
+  Stack: 'stack',
+  Queue: 'queue',
+  Set: 'set',
+  button: 'GuiElement',
+  text: 'GuiElement',
+  heading: 'GuiElement',
+  image: 'GuiElement',
+  link: 'GuiElement',
+  textarea: 'GuiElement',
+  checkbox: 'GuiElement',
+  radio: 'GuiElement',
+  video: 'GuiElement',
+  audio: 'GuiElement',
+  select: 'GuiElement',
+  option: 'GuiElement',
+  container: 'GuiElement',
+  line: 'GuiElement',
+  row: 'GuiElement',
+  column: 'GuiElement',
+  grid: 'GuiElement',
+  form: 'GuiElement',
+  onClick: 'GuiElement',
+  onInput: 'GuiElement',
+  onChange: 'GuiElement',
+  onSubmit: 'GuiElement',
+  click: 'GuiElement',
+  section: 'GuiElement',
+  dom: 'GuiElement',
+  byId: 'GuiElement',
+  getById: 'GuiElement',
+  selectId: 'GuiElement',
+  render: 'GuiElement',
+  mount: 'GuiElement',
+  unique_ptr: 'ptr',
+  make_unique: 'ptr',
+  shared_ptr: 'ptr',
+  make_shared: 'ptr',
+  weak_ptr: 'ptr',
+  addressOf: 'string',
+  addr: 'string',
+  browserLocation: 'dict',
+};
+
 interface ScopeEntry {
   symbol: SymbolRecord;
+  typeAnnotation?: TypeAnnotationNode;
   pointer?: PointerRecord;
+  isConstPointee?: boolean;
 }
 
 export class Transformer {
@@ -73,11 +192,16 @@ export class Transformer {
   private readonly classes = new Map<string, ClassDeclarationNode>();
   private readonly structs = new Map<string, StructDeclarationNode>();
   private readonly enums = new Map<string, EnumDeclarationNode>();
+  private readonly functionReturnTypes = new Map<string, string>();
+  private readonly refFunctionParams = new Map<string, boolean[]>();
   private readonly asyncFunctions = new Set<string>();
   private currentFunctionName: string | null = null;
   private topLevelAsync = false;
+  private isYourGuiProgram = false;
 
   public transform(program: ProgramNode): TransformResult {
+    this.isYourGuiProgram = this.detectYourGuiProgram(program);
+
     // Pre-register top-level type declarations for forward references & trait validation
     for (const stmt of program.body) {
       if (stmt.kind === 'TraitDeclaration') {
@@ -88,6 +212,16 @@ export class Transformer {
         this.structs.set(stmt.name, stmt);
       } else if (stmt.kind === 'EnumDeclaration') {
         this.enums.set(stmt.name, stmt);
+      } else if (stmt.kind === 'FunctionDeclaration') {
+        if (stmt.returnType) {
+          this.functionReturnTypes.set(stmt.name, this.normalizeTypeName(stmt.returnType.name));
+        }
+        if (stmt.params.some((p) => Boolean(p.typeAnnotation?.isReference))) {
+          this.refFunctionParams.set(
+            stmt.name,
+            stmt.params.map((p) => Boolean(p.typeAnnotation?.isReference))
+          );
+        }
       }
     }
 
@@ -103,6 +237,7 @@ export class Transformer {
       pointers: this.allPointers,
       asyncFunctions: Array.from(this.asyncFunctions),
       topLevelAsync: this.topLevelAsync,
+      refFunctionParams: Object.fromEntries(this.refFunctionParams.entries()),
     };
   }
 
@@ -118,7 +253,9 @@ export class Transformer {
 
   private declareSymbol(
     symbol: Omit<SymbolRecord, 'scopeDepth'>,
-    pointer?: Omit<PointerRecord, 'borrowCount'>
+    pointer?: Omit<PointerRecord, 'borrowCount'>,
+    typeAnnotation?: TypeAnnotationNode,
+    isConstPointee = false
   ): ScopeEntry {
     const scope = this.scopes[this.scopes.length - 1];
     const fullSymbol: SymbolRecord = {
@@ -129,7 +266,7 @@ export class Transformer {
       ? { ...pointer, borrowCount: 0 }
       : undefined;
 
-    const entry: ScopeEntry = { symbol: fullSymbol, pointer: fullPointer };
+    const entry: ScopeEntry = { symbol: fullSymbol, typeAnnotation, pointer: fullPointer, isConstPointee };
     scope.set(symbol.name, entry);
     this.allSymbols.push(fullSymbol);
     if (fullPointer) {
@@ -146,8 +283,14 @@ export class Transformer {
     return undefined;
   }
 
-  private reportError(message: string, line: number, column: number, hint?: string): void {
-    const err = new TransformError(message, line, column, hint);
+  private reportError(
+    message: string,
+    line: number,
+    column: number,
+    hint?: string,
+    title?: string
+  ): void {
+    const err = new TransformError(message, line, column, hint, title);
     this.diagnostics.push(err.toDiagnostic('error'));
   }
 
@@ -160,6 +303,46 @@ export class Transformer {
     switch (stmt.kind) {
       case 'VarDeclaration':
         return this.transformVarDecl(stmt);
+
+      case 'MultiVarDeclaration':
+        return {
+          ...stmt,
+          declarations: stmt.declarations.map((d) => this.transformVarDecl(d)),
+        };
+
+      case 'ImportStatement': {
+        if (stmt.defaultImport) {
+          this.declareSymbol({
+            name: stmt.defaultImport,
+            kind: 'module',
+            mutable: false,
+            typeName: 'module',
+            line: stmt.line,
+            column: stmt.column,
+          });
+        }
+        if (stmt.alias) {
+          this.declareSymbol({
+            name: stmt.alias,
+            kind: 'module',
+            mutable: false,
+            typeName: 'module',
+            line: stmt.line,
+            column: stmt.column,
+          });
+        }
+        for (const named of stmt.namedImports) {
+          this.declareSymbol({
+            name: named,
+            kind: 'variable',
+            mutable: false,
+            typeName: STDLIB_RETURN_TYPES[named] ? 'function' : 'any',
+            line: stmt.line,
+            column: stmt.column,
+          });
+        }
+        return stmt;
+      }
 
       case 'FunctionDeclaration':
         return this.transformFunctionDecl(stmt);
@@ -240,9 +423,23 @@ export class Transformer {
           body: this.transformBlock(stmt.body),
         };
 
+      case 'DoWhileStatement':
+        return {
+          ...stmt,
+          body: this.transformBlock(stmt.body),
+          condition: this.transformExpression(stmt.condition),
+        };
+
       case 'LoopStatement':
         return {
           ...stmt,
+          body: this.transformBlock(stmt.body),
+        };
+
+      case 'RepeatStatement':
+        return {
+          ...stmt,
+          count: this.transformExpression(stmt.count),
           body: this.transformBlock(stmt.body),
         };
 
@@ -324,10 +521,12 @@ export class Transformer {
           !this.lookup(expr.target.name)
         ) {
           const initializer = this.transformExpression(expr.value);
+          const inferredType = this.inferExpressionType(initializer);
           this.declareSymbol({
             name: expr.target.name,
             kind: 'variable',
             mutable: true,
+            typeName: inferredType,
             line: expr.line,
             column: expr.column,
           });
@@ -346,6 +545,7 @@ export class Transformer {
         };
       }
 
+      case 'StyleStatement':
       case 'BreakStatement':
       case 'ContinueStatement':
         return stmt;
@@ -367,17 +567,60 @@ export class Transformer {
     }
 
     if (!inferredPointerMode && stmt.typeAnnotation) {
-      if (stmt.typeAnnotation.name === 'own') inferredPointerMode = 'own';
+      if (stmt.typeAnnotation.isReference) inferredPointerMode = 'cpp_ref';
+      else if (stmt.typeAnnotation.isPointer) inferredPointerMode = 'ptr';
+      else if (stmt.typeAnnotation.name === 'unique_ptr') inferredPointerMode = 'unique';
+      else if (stmt.typeAnnotation.name === 'shared_ptr') inferredPointerMode = 'shared';
+      else if (stmt.typeAnnotation.name === 'weak_ptr') inferredPointerMode = 'weak';
+      else if (stmt.typeAnnotation.name === 'own') inferredPointerMode = 'own';
       else if (stmt.typeAnnotation.name === 'ref') inferredPointerMode = 'ref';
       else if (stmt.typeAnnotation.name === 'shared') inferredPointerMode = 'shared';
     }
+
+    if (
+      !inferredPointerMode &&
+      initializer?.kind === 'CallExpression' &&
+      initializer.callee.kind === 'Identifier'
+    ) {
+      if (initializer.callee.name === 'make_unique' || initializer.callee.name === 'unique_ptr') {
+        inferredPointerMode = 'unique';
+      } else if (initializer.callee.name === 'make_shared' || initializer.callee.name === 'shared_ptr') {
+        inferredPointerMode = 'shared';
+      } else if (initializer.callee.name === 'weak_ptr') {
+        inferredPointerMode = 'weak';
+      }
+    }
+
+    if (inferredPointerMode === 'cpp_ref' && !initializer) {
+      this.reportError(
+        `Reference '${stmt.name}' must be initialized when declared.`,
+        stmt.line,
+        stmt.column,
+        `Initialize '${stmt.name}' to a variable, e.g. \`int& ${stmt.name} = target\`.`
+      );
+    }
+
+    const actualType = initializer ? this.inferExpressionType(initializer) : undefined;
+    if (stmt.typeAnnotation && actualType && !inferredPointerMode) {
+      this.checkTypeCompatibility(
+        stmt.typeAnnotation,
+        actualType,
+        stmt.name,
+        stmt.line,
+        stmt.column
+      );
+    }
+
+    const resolvedTypeName = stmt.typeAnnotation
+      ? this.formatTypeAnnotation(stmt.typeAnnotation)
+      : actualType;
 
     this.declareSymbol(
       {
         name: stmt.name,
         kind: stmt.mutable ? 'variable' : 'const',
         mutable: stmt.mutable,
-        typeName: stmt.typeAnnotation?.name,
+        typeName: resolvedTypeName,
         pointerMode: inferredPointerMode,
         line: stmt.line,
         column: stmt.column,
@@ -391,7 +634,9 @@ export class Transformer {
             column: stmt.column,
             lastEventLine: stmt.line,
           }
-        : undefined
+        : undefined,
+      stmt.typeAnnotation,
+      Boolean(stmt.typeAnnotation?.isConst)
     );
 
     return {
@@ -402,11 +647,17 @@ export class Transformer {
   }
 
   private transformFunctionDecl(stmt: FunctionDeclarationNode): FunctionDeclarationNode {
+    if (stmt.params.some((p) => Boolean(p.typeAnnotation?.isReference))) {
+      this.refFunctionParams.set(
+        stmt.name,
+        stmt.params.map((p) => Boolean(p.typeAnnotation?.isReference))
+      );
+    }
     this.declareSymbol({
       name: stmt.name,
       kind: 'function',
       mutable: false,
-      typeName: stmt.returnType?.name ?? 'void',
+      typeName: stmt.returnType ? this.formatTypeAnnotation(stmt.returnType) : 'void',
       line: stmt.line,
       column: stmt.column,
     });
@@ -419,14 +670,18 @@ export class Transformer {
       const defaultValue = param.defaultValue
         ? this.transformExpression(param.defaultValue)
         : undefined;
-      this.declareSymbol({
-        name: param.name,
-        kind: 'param',
-        mutable: true,
-        typeName: param.typeAnnotation?.name,
-        line: param.line,
-        column: param.column,
-      });
+      this.declareSymbol(
+        {
+          name: param.name,
+          kind: 'param',
+          mutable: true,
+          typeName: param.typeAnnotation ? this.formatTypeAnnotation(param.typeAnnotation) : undefined,
+          line: param.line,
+          column: param.column,
+        },
+        undefined,
+        param.typeAnnotation
+      );
       return { ...param, defaultValue };
     });
 
@@ -438,6 +693,7 @@ export class Transformer {
   }
 
   private transformClassDecl(stmt: ClassDeclarationNode): ClassDeclarationNode {
+    this.classes.set(stmt.name, stmt);
     this.declareSymbol({
       name: stmt.name,
       kind: 'class',
@@ -455,13 +711,13 @@ export class Transformer {
       );
     }
 
-    // Validate implemented traits
+    // Validate implemented traits / interfaces
     const methodNames = new Set(stmt.methods.map((m) => m.name));
     for (const traitName of stmt.traits) {
       const trait = this.traits.get(traitName);
       if (!trait) {
         this.reportError(
-          `Unknown trait '${traitName}' implemented by class '${stmt.name}'.`,
+          `Unknown trait/interface '${traitName}' implemented by class '${stmt.name}'.`,
           stmt.line,
           stmt.column
         );
@@ -470,7 +726,7 @@ export class Transformer {
       for (const reqMethod of trait.methods) {
         if (!methodNames.has(reqMethod.name)) {
           this.reportError(
-            `Class '${stmt.name}' does not implement required method '${reqMethod.name}()' from trait '${traitName}'.`,
+            `Class '${stmt.name}' does not implement required method '${reqMethod.name}()' from '${traitName}'.`,
             stmt.line,
             stmt.column,
             `Add \`pub fn ${reqMethod.name}(...) { ... }\` to class '${stmt.name}'.`
@@ -490,14 +746,20 @@ export class Transformer {
         const defaultValue = param.defaultValue
           ? this.transformExpression(param.defaultValue)
           : undefined;
-        this.declareSymbol({
-          name: param.name,
-          kind: 'param',
-          mutable: true,
-          typeName: param.typeAnnotation?.name,
-          line: param.line,
-          column: param.column,
-        });
+        this.declareSymbol(
+          {
+            name: param.name,
+            kind: 'param',
+            mutable: true,
+            typeName: param.typeAnnotation
+              ? this.formatTypeAnnotation(param.typeAnnotation)
+              : undefined,
+            line: param.line,
+            column: param.column,
+          },
+          undefined,
+          param.typeAnnotation
+        );
         return { ...param, defaultValue };
       });
       const body = this.transformBlock(method.body, false);
@@ -526,14 +788,20 @@ export class Transformer {
     const methods = stmt.methods.map((m) => {
       this.pushScope();
       for (const param of m.params) {
-        this.declareSymbol({
-          name: param.name,
-          kind: 'param',
-          mutable: true,
-          typeName: param.typeAnnotation?.name,
-          line: param.line,
-          column: param.column,
-        });
+        this.declareSymbol(
+          {
+            name: param.name,
+            kind: 'param',
+            mutable: true,
+            typeName: param.typeAnnotation
+              ? this.formatTypeAnnotation(param.typeAnnotation)
+              : undefined,
+            line: param.line,
+            column: param.column,
+          },
+          undefined,
+          param.typeAnnotation
+        );
       }
       const body = this.transformBlock(m.body, false);
       this.popScope();
@@ -626,6 +894,20 @@ export class Transformer {
       }
 
       case 'AssignmentExpression': {
+        const transformedValue = this.transformExpression(expr.value);
+        if (expr.target.kind === 'PointerExpression' && expr.target.op === 'deref') {
+          if (expr.target.argument.kind === 'Identifier') {
+            const entry = this.lookup(expr.target.argument.name);
+            if (entry?.isConstPointee) {
+              this.reportError(
+                `Cannot modify value through const pointer '${expr.target.argument.name}'.`,
+                expr.line,
+                expr.column,
+                'Declare without `const` pointee qualifier if mutation is intended.'
+              );
+            }
+          }
+        }
         if (expr.target.kind === 'Identifier') {
           const entry = this.lookup(expr.target.name);
           if (entry && !entry.symbol.mutable && entry.symbol.kind === 'const') {
@@ -633,8 +915,31 @@ export class Transformer {
               `Cannot reassign constant '${expr.target.name}'.`,
               expr.line,
               expr.column,
-              'Declare with `let` instead of `const` if reassignment is required.'
+              'Declare with `var` or `let` instead of `const` if reassignment is required.'
             );
+          } else if (entry && entry.symbol.pointerMode === 'ptr' && !entry.symbol.mutable && expr.operator === '=') {
+            this.reportError(
+              `Cannot reassign const pointer '${expr.target.name}'.`,
+              expr.line,
+              expr.column
+            );
+          } else if (entry?.isConstPointee && entry.symbol.pointerMode === 'cpp_ref') {
+            this.reportError(
+              `Cannot modify const reference '${expr.target.name}'.`,
+              expr.line,
+              expr.column
+            );
+          } else if (entry?.typeAnnotation && expr.operator === '=') {
+            const actualType = this.inferExpressionType(transformedValue);
+            if (actualType) {
+              this.checkTypeCompatibility(
+                entry.typeAnnotation,
+                actualType,
+                expr.target.name,
+                expr.line,
+                expr.column
+              );
+            }
           }
         }
         return {
@@ -645,7 +950,7 @@ export class Transformer {
               : expr.target.kind === 'Identifier'
                 ? expr.target
                 : this.transformExpression(expr.target),
-          value: this.transformExpression(expr.value),
+          value: transformedValue,
         };
       }
 
@@ -670,6 +975,14 @@ export class Transformer {
           column: expr.column,
         };
       }
+
+      case 'ConditionalExpression':
+        return {
+          ...expr,
+          condition: this.transformExpression(expr.condition),
+          consequent: this.transformExpression(expr.consequent),
+          alternate: this.transformExpression(expr.alternate),
+        };
 
       case 'BinaryExpression':
         return {
@@ -703,12 +1016,53 @@ export class Transformer {
       case 'CallExpression': {
         if (expr.callee.kind === 'Identifier') {
           const fnName = expr.callee.name;
+          if (this.classes.has(fnName)) {
+            return {
+              kind: 'NewExpression',
+              className: fnName,
+              args: expr.args.map((a) => this.transformExpression(a)),
+              line: expr.line,
+              column: expr.column,
+            };
+          }
+          // Disambiguate bare input("Enter your name") inside yourgui websites -> yourgui.input(...)
+          if (fnName === 'input' && this.isYourGuiProgram && !this.lookup('input')) {
+            return {
+              ...expr,
+              callee: {
+                kind: 'MemberExpression',
+                object: {
+                  kind: 'Identifier',
+                  name: 'yourgui',
+                  line: expr.line,
+                  column: expr.column,
+                },
+                property: 'input',
+                optional: false,
+                line: expr.line,
+                column: expr.column,
+              },
+              args: expr.args.map((a) => this.transformExpression(a)),
+            };
+          }
           if (INTERACTIVE_IO_FUNCTIONS.has(fnName) || this.asyncFunctions.has(fnName)) {
             if (this.currentFunctionName) {
               this.asyncFunctions.add(this.currentFunctionName);
             } else {
               this.topLevelAsync = true;
             }
+          }
+        } else if (
+          expr.callee.kind === 'MemberExpression' &&
+          expr.callee.object.kind === 'Identifier' &&
+          ((expr.callee.object.name === 'server' && expr.callee.property === 'request') ||
+            (expr.callee.object.name === 'http' &&
+              (expr.callee.property === 'get' || expr.callee.property === 'post')))
+        ) {
+          if (this.currentFunctionName) {
+            this.asyncFunctions.add(this.currentFunctionName);
+          } else {
+            this.topLevelAsync = true;
           }
         }
         return {
@@ -735,6 +1089,7 @@ export class Transformer {
         return {
           ...expr,
           args: expr.args.map((a) => this.transformExpression(a)),
+          countExpr: expr.countExpr ? this.transformExpression(expr.countExpr) : undefined,
         };
 
       case 'StructInitExpression':
@@ -774,14 +1129,18 @@ export class Transformer {
       case 'LambdaExpression': {
         this.pushScope();
         for (const p of expr.params) {
-          this.declareSymbol({
-            name: p.name,
-            kind: 'param',
-            mutable: true,
-            typeName: p.typeAnnotation?.name,
-            line: p.line,
-            column: p.column,
-          });
+          this.declareSymbol(
+            {
+              name: p.name,
+              kind: 'param',
+              mutable: true,
+              typeName: p.typeAnnotation ? this.formatTypeAnnotation(p.typeAnnotation) : undefined,
+              line: p.line,
+              column: p.column,
+            },
+            undefined,
+            p.typeAnnotation
+          );
         }
         const body =
           expr.body.kind === 'BlockStatement'
@@ -836,6 +1195,291 @@ export class Transformer {
       case 'SuperExpression':
         return expr;
     }
+  }
+
+  // ==========================================================================
+  // Static Type Inference & Validation
+  // ==========================================================================
+
+  private normalizeTypeName(raw: string): string {
+    switch (raw.trim()) {
+      case 'str':
+      case 'text':
+      case 'string':
+        return 'string';
+      case 'bool':
+      case 'boolean':
+        return 'boolean';
+      case 'list':
+      case 'array':
+        return 'array';
+      case 'map':
+      case 'dict':
+        return 'dict';
+      case 'none':
+      case 'null':
+        return 'null';
+      default:
+        return raw.trim();
+    }
+  }
+
+  private formatTypeAnnotation(t: TypeAnnotationNode): string {
+    if (t.unionTypes && t.unionTypes.length > 0) {
+      return t.unionTypes.map((u) => this.formatTypeAnnotation(u)).join(' | ');
+    }
+    const base = t.generics.length > 0
+      ? `${t.name}<${t.generics.map((g) => this.formatTypeAnnotation(g)).join(', ')}>`
+      : t.name;
+    return t.nullable ? `${base}?` : base;
+  }
+
+  private inferExpressionType(expr: ExpressionNode): string | undefined {
+    switch (expr.kind) {
+      case 'Literal':
+        if (expr.literalType === 'int') return 'int';
+        if (expr.literalType === 'float') return 'float';
+        if (expr.literalType === 'str') return 'string';
+        if (expr.literalType === 'bool') return 'boolean';
+        if (expr.literalType === 'null') return 'null';
+        return undefined;
+
+      case 'FString':
+        return 'string';
+
+      case 'ArrayLiteral':
+      case 'RangeExpression':
+        return 'array';
+
+      case 'MapLiteral':
+        return 'dict';
+
+      case 'NewExpression':
+        return expr.className;
+
+      case 'StructInitExpression':
+        return expr.structName;
+
+      case 'LambdaExpression':
+        return 'function';
+
+      case 'Identifier': {
+        const found = this.lookup(expr.name);
+        if (!found?.symbol.typeName) return undefined;
+        // Strip `?` and generics for base inference if simple
+        const raw = found.symbol.typeName.replace(/\?$/, '');
+        if (raw.includes('|')) return undefined;
+        const base = raw.split('<')[0];
+        return this.normalizeTypeName(base);
+      }
+
+      case 'UnaryExpression':
+        if (expr.operator === '!') return 'boolean';
+        if (expr.operator === '-') return this.inferExpressionType(expr.operand);
+        return undefined;
+
+      case 'BinaryExpression': {
+        if (
+          ['==', '!=', '<', '<=', '>', '>=', 'in', 'not in', 'is'].includes(expr.operator)
+        ) {
+          return 'boolean';
+        }
+        const lt = this.inferExpressionType(expr.left);
+        const rt = this.inferExpressionType(expr.right);
+        if (expr.operator === '+') {
+          if (lt === 'string' || rt === 'string') return 'string';
+          if (this.isNumeric(lt) && this.isNumeric(rt)) {
+            return lt === 'int' && rt === 'int' ? 'int' : 'number';
+          }
+          return undefined;
+        }
+        if (['-', '*', '/', '%', '**'].includes(expr.operator)) {
+          if (expr.operator === '/') return 'number';
+          if (lt === 'int' && rt === 'int') return 'int';
+          if (this.isNumeric(lt) && this.isNumeric(rt)) return 'number';
+        }
+        return undefined;
+      }
+
+      case 'LogicalExpression':
+        if (expr.operator === 'and' || expr.operator === 'or') {
+          const lt = this.inferExpressionType(expr.left);
+          const rt = this.inferExpressionType(expr.right);
+          if (lt === 'boolean' && rt === 'boolean') return 'boolean';
+        }
+        return undefined;
+
+      case 'ConditionalExpression': {
+        const ct = this.inferExpressionType(expr.consequent);
+        const at = this.inferExpressionType(expr.alternate);
+        if (ct && at && ct === at) return ct;
+        if (this.isNumeric(ct) && this.isNumeric(at)) return 'number';
+        return undefined;
+      }
+
+      case 'CallExpression': {
+        if (expr.callee.kind === 'Identifier') {
+          const fn = expr.callee.name;
+          if (STDLIB_RETURN_TYPES[fn]) return STDLIB_RETURN_TYPES[fn];
+          if (this.functionReturnTypes.has(fn)) return this.functionReturnTypes.get(fn);
+        }
+        return undefined;
+      }
+
+      default:
+        return undefined;
+    }
+  }
+
+  private isNumeric(t?: string): boolean {
+    return t === 'int' || t === 'float' || t === 'number';
+  }
+
+  private matchesSingleAnnotation(expected: TypeAnnotationNode, actual: string): boolean {
+    const exp = this.normalizeTypeName(expected.name);
+    const act = this.normalizeTypeName(actual);
+
+    if (exp === 'any' || act === 'any') return true;
+    if (act === 'null') return expected.nullable || exp === 'null' || exp === 'option';
+
+    if (exp === 'number') return act === 'int' || act === 'float' || act === 'number';
+    if (exp === 'float') return act === 'float' || act === 'int' || act === 'number';
+    if (exp === 'int') return act === 'int';
+
+    return exp === act;
+  }
+
+  private checkTypeCompatibility(
+    expected: TypeAnnotationNode,
+    actual: string,
+    targetName: string,
+    line: number,
+    column: number
+  ): void {
+    // Allow generic type params (single uppercase letter like `T`)
+    if (/^[A-Z]$/.test(expected.name)) return;
+
+    if (expected.unionTypes && expected.unionTypes.length > 0) {
+      const ok = expected.unionTypes.some((u) => this.matchesSingleAnnotation(u, actual));
+      if (!ok) {
+        this.reportError(
+          `Cannot assign '${actual}' to variable '${targetName}' of type '${this.formatTypeAnnotation(expected)}'.`,
+          line,
+          column,
+          `Update the value or widen '${targetName}' using a union type like '${this.formatTypeAnnotation(expected)} | ${actual}'.`,
+          'Type Error'
+        );
+      }
+      return;
+    }
+
+    if (!this.matchesSingleAnnotation(expected, actual)) {
+      const hint =
+        actual === 'null'
+          ? `Use optional type '${expected.name}?' if null values are allowed.`
+          : `Expected a value of type '${this.formatTypeAnnotation(expected)}', but received '${actual}'.`;
+      this.reportError(
+        `Cannot assign '${actual}' to variable '${targetName}' of type '${this.formatTypeAnnotation(expected)}'.`,
+        line,
+        column,
+        hint,
+        'Type Error'
+      );
+    }
+  }
+
+  private detectYourGuiProgram(program: ProgramNode): boolean {
+    const visitExpr = (expr: ExpressionNode): boolean => {
+      switch (expr.kind) {
+        case 'Identifier':
+          return expr.name === 'yourgui';
+        case 'CallExpression': {
+          if (expr.callee.kind === 'Identifier') {
+            const name = expr.callee.name;
+            if (
+              (YOURGUI_ELEMENT_NAMES.has(name) && name !== 'input') ||
+              YOURGUI_EVENT_HELPER_NAMES.has(name)
+            ) {
+              return true;
+            }
+          }
+          if (visitExpr(expr.callee)) return true;
+          return expr.args.some(visitExpr);
+        }
+        case 'MemberExpression':
+          return visitExpr(expr.object);
+        case 'AssignmentExpression':
+          return visitExpr(expr.target) || visitExpr(expr.value);
+        case 'BinaryExpression':
+        case 'LogicalExpression':
+        case 'PipeExpression':
+          return visitExpr(expr.left) || visitExpr(expr.right);
+        case 'UnaryExpression':
+          return visitExpr(expr.operand);
+        case 'ConditionalExpression':
+          return visitExpr(expr.condition) || visitExpr(expr.consequent) || visitExpr(expr.alternate);
+        case 'ArrayLiteral':
+          return expr.elements.some(visitExpr);
+        case 'MapLiteral':
+          return expr.entries.some((e) => visitExpr(e.key) || visitExpr(e.value));
+        case 'LambdaExpression':
+          return expr.body.kind === 'BlockStatement' ? visitStmt(expr.body) : visitExpr(expr.body);
+        default:
+          return false;
+      }
+    };
+
+    const visitStmt = (stmt: StatementNode): boolean => {
+      switch (stmt.kind) {
+        case 'StyleStatement':
+          return true;
+        case 'ImportStatement':
+          return stmt.modulePath === 'stdlib/yourgui' || stmt.modulePath === 'yourgui';
+        case 'VarDeclaration':
+          return stmt.initializer ? visitExpr(stmt.initializer) : false;
+        case 'MultiVarDeclaration':
+          return stmt.declarations.some((d) => (d.initializer ? visitExpr(d.initializer) : false));
+        case 'FunctionDeclaration':
+          return visitStmt(stmt.body);
+        case 'BlockStatement':
+          return stmt.statements.some(visitStmt);
+        case 'ScopeStatement':
+          return visitStmt(stmt.body);
+        case 'IfStatement':
+          return (
+            visitExpr(stmt.condition) ||
+            visitStmt(stmt.consequent) ||
+            stmt.elifBranches.some((b) => visitExpr(b.condition) || visitStmt(b.consequent)) ||
+            (stmt.alternate ? visitStmt(stmt.alternate) : false)
+          );
+        case 'ForInStatement':
+          return visitExpr(stmt.iterable) || visitStmt(stmt.body);
+        case 'CForStatement':
+          return (
+            (stmt.init ? visitStmt(stmt.init) : false) ||
+            (stmt.condition ? visitExpr(stmt.condition) : false) ||
+            (stmt.update ? visitExpr(stmt.update) : false) ||
+            visitStmt(stmt.body)
+          );
+        case 'TryCatchStatement':
+          return visitStmt(stmt.tryBlock) || visitStmt(stmt.catchBlock);
+        case 'WhileStatement':
+        case 'DoWhileStatement':
+          return visitExpr(stmt.condition) || visitStmt(stmt.body);
+        case 'LoopStatement':
+          return visitStmt(stmt.body);
+        case 'RepeatStatement':
+          return visitExpr(stmt.count) || visitStmt(stmt.body);
+        case 'ExpressionStatement':
+          return visitExpr(stmt.expression);
+        case 'ReturnStatement':
+          return stmt.value ? visitExpr(stmt.value) : false;
+        default:
+          return false;
+      }
+    };
+
+    return program.body.some(visitStmt);
   }
 }
 

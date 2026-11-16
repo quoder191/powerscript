@@ -48,6 +48,8 @@ export enum TokenType {
   In = 'In',
   While = 'While',
   Loop = 'Loop',
+  Repeat = 'Repeat',
+  Times = 'Times',
   Break = 'Break',
   Continue = 'Continue',
   Match = 'Match',
@@ -66,9 +68,12 @@ export enum TokenType {
   Is = 'Is',
   As = 'As',
 
-  // Module Keywords
+  // Module & UI Keywords
   Import = 'Import',
   Export = 'Export',
+  From = 'From',
+  Style = 'Style',
+  StyleBlock = 'StyleBlock',
 
   // Operators
   Plus = 'Plus',                 // +
@@ -96,6 +101,7 @@ export enum TokenType {
   Bang = 'Bang',                 // !
   Ampersand = 'Ampersand',       // &
   AndAnd = 'AndAnd',             // &&
+  Pipe = 'Pipe',                 // |
   PipePipe = 'PipePipe',         // ||
   PipeArrow = 'PipeArrow',       // |>
   Arrow = 'Arrow',               // ->
@@ -121,6 +127,8 @@ export enum TokenType {
 
   // Special
   Newline = 'Newline',
+  Indent = 'Indent',
+  Dedent = 'Dedent',
   EOF = 'EOF',
 }
 

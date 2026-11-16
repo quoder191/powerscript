@@ -19,6 +19,7 @@ export interface ParseResult {
 export class Parser {
   private readonly tokens: Token[];
   public readonly diagnostics: CompilerDiagnostic[] = [];
+  public allowStructInit = true;
   private current = 0;
 
   constructor(tokens: Token[]) {
@@ -28,17 +29,36 @@ export class Parser {
   public parse(): ParseResult {
     const body: StatementNode[] = [];
     this.skipSeparators();
+    let recoveredFromError = false;
 
     while (!this.isAtEnd()) {
+      const startPos = this.current;
       try {
         const stmt = parseDeclaration(this);
         if (stmt) {
           body.push(stmt);
+          recoveredFromError = false;
+        } else if (this.current === startPos && !this.isAtEnd()) {
+          // Consume stray closing delimiters (`}` or `Dedent`) so Parser.parse() always advances
+          if (recoveredFromError && this.check(TokenType.Dedent)) {
+            this.advance();
+          } else {
+            const bad = this.peek();
+            this.diagnostics.push(
+              this.error(
+                bad,
+                `Unexpected token '${bad.lexeme || bad.type}'.`,
+                'Check for an extra closing brace or mismatched indentation.'
+              ).toDiagnostic('error')
+            );
+            this.advance();
+          }
         }
       } catch (err) {
         if (err instanceof ParserError) {
           this.diagnostics.push(err.toDiagnostic('error'));
           this.synchronize();
+          recoveredFromError = true;
         } else {
           throw err;
         }
@@ -58,6 +78,10 @@ export class Parser {
     };
   }
 
+  public getPosition(): number {
+    return this.current;
+  }
+
   public parseExpr(): ExpressionNode {
     return parseExpression(this);
   }
@@ -67,7 +91,35 @@ export class Parser {
   }
 
   public parseTypeAnnotation(): TypeAnnotationNode {
+    const first = this.parseSingleTypeAnnotation();
+
+    if (this.check(TokenType.Or) || this.check(TokenType.Pipe)) {
+      const unionTypes: TypeAnnotationNode[] = [first];
+      while (this.match(TokenType.Or, TokenType.Pipe)) {
+        this.skipNewlines();
+        unionTypes.push(this.parseSingleTypeAnnotation());
+      }
+      return {
+        kind: 'TypeAnnotation',
+        name: unionTypes.map((t) => t.name).join(' | '),
+        generics: [],
+        nullable: unionTypes.some((t) => t.nullable),
+        unionTypes,
+        line: first.line,
+        column: first.column,
+      };
+    }
+
+    return first;
+  }
+
+  private parseSingleTypeAnnotation(): TypeAnnotationNode {
     const start = this.peek();
+    const isConst = this.match(TokenType.Const);
+    if (this.check(TokenType.Identifier) && this.peek().lexeme === 'std' && this.checkNext(TokenType.DoubleColon)) {
+      this.advance();
+      this.advance();
+    }
     if (!this.check(TokenType.Identifier) && !this.isTypeKeyword(this.peek().type)) {
       throw this.error(this.peek(), `Expected type name, got '${this.peek().lexeme}'`);
     }
@@ -85,6 +137,13 @@ export class Parser {
       this.consume(TokenType.Greater, "Expected '>' after generic type arguments.");
     }
 
+    let isPointer = 0;
+    while (this.check(TokenType.Star) || this.check(TokenType.Power)) {
+      const tok = this.advance();
+      isPointer += tok.type === TokenType.Power ? 2 : 1;
+    }
+    const isReference = isPointer === 0 ? this.match(TokenType.Ampersand) : false;
+    const isConstPointer = isPointer > 0 ? this.match(TokenType.Const) : false;
     const nullable = this.match(TokenType.Question);
 
     return {
@@ -92,9 +151,54 @@ export class Parser {
       name: nameToken.lexeme,
       generics,
       nullable,
+      isPointer: isPointer > 0 ? isPointer : undefined,
+      isReference: isReference || undefined,
+      isConst: isConst || undefined,
+      isConstPointer: isConstPointer || undefined,
       line: start.line,
       column: start.column,
     };
+  }
+
+  public parseGenericParams(): string[] | undefined {
+    if (!this.match(TokenType.Less)) return undefined;
+    const params: string[] = [];
+    this.skipNewlines();
+    if (!this.check(TokenType.Greater)) {
+      do {
+        this.skipNewlines();
+        const tp = this.consume(TokenType.Identifier, 'Expected generic type parameter name.');
+        params.push(tp.lexeme);
+        this.skipNewlines();
+      } while (this.match(TokenType.Comma));
+    }
+    this.consume(TokenType.Greater, "Expected '>' after generic type parameters.");
+    return params;
+  }
+
+  private looksLikeTypeFirstParam(): boolean {
+    if (this.check(TokenType.Const)) return true;
+    if (this.check(TokenType.Identifier) && this.peek().lexeme === 'std' && this.checkNext(TokenType.DoubleColon)) {
+      return true;
+    }
+    if (!this.check(TokenType.Identifier) && !this.isTypeKeyword(this.peek().type)) {
+      return false;
+    }
+    const next = this.peekTokenAt(1);
+    if (
+      next.type === TokenType.Colon ||
+      next.type === TokenType.Assign ||
+      next.type === TokenType.Comma ||
+      next.type === TokenType.RightParen
+    ) {
+      return false;
+    }
+    return (
+      next.type === TokenType.Star ||
+      next.type === TokenType.Ampersand ||
+      next.type === TokenType.Less ||
+      next.type === TokenType.Identifier
+    );
   }
 
   public parseParamList(): ParamNode[] {
@@ -103,16 +207,24 @@ export class Parser {
 
     if (!this.check(TokenType.RightParen)) {
       do {
+        const loopStart = this.current;
         this.skipNewlines();
         if (this.check(TokenType.RightParen)) break;
 
-        const nameToken = this.consume(TokenType.Identifier, 'Expected parameter name.');
+        let nameToken: Token;
         let typeAnnotation: TypeAnnotationNode | undefined;
         let defaultValue: ExpressionNode | undefined;
 
-        if (this.match(TokenType.Colon)) {
+        if (this.looksLikeTypeFirstParam()) {
           typeAnnotation = this.parseTypeAnnotation();
+          nameToken = this.consume(TokenType.Identifier, 'Expected parameter name after type.');
+        } else {
+          nameToken = this.consume(TokenType.Identifier, 'Expected parameter name.');
+          if (this.match(TokenType.Colon)) {
+            typeAnnotation = this.parseTypeAnnotation();
+          }
         }
+
         if (this.match(TokenType.Assign)) {
           defaultValue = this.parseExpr();
         }
@@ -126,6 +238,9 @@ export class Parser {
           column: nameToken.column,
         });
         this.skipNewlines();
+        if (this.current === loopStart && !this.isAtEnd()) {
+          throw this.error(this.peek(), `Unexpected token '${this.peek().lexeme || this.peek().type}' in parameter list.`);
+        }
       } while (this.match(TokenType.Comma));
     }
 
@@ -154,8 +269,10 @@ export class Parser {
     if (
       this.isAtEnd() ||
       this.check(TokenType.RightBrace) ||
+      this.check(TokenType.Dedent) ||
       this.check(TokenType.Newline) ||
-      this.check(TokenType.Semicolon)
+      this.check(TokenType.Semicolon) ||
+      this.previous().type === TokenType.Dedent
     ) {
       this.skipSeparators();
       return;
@@ -165,6 +282,11 @@ export class Parser {
       `Unexpected token '${this.peek().lexeme}' at end of statement.`,
       'Add a newline or semicolon between statements.'
     );
+  }
+
+  public peekTokenAt(offset: number): Token {
+    const idx = Math.min(this.current + offset, this.tokens.length - 1);
+    return this.tokens[Math.max(0, idx)];
   }
 
   public match(...types: TokenType[]): boolean {
@@ -257,7 +379,9 @@ export class Parser {
         case TokenType.Trait:
         case TokenType.Fn:
         case TokenType.Let:
+        case TokenType.Var:
         case TokenType.Const:
+        case TokenType.Import:
         case TokenType.Own:
         case TokenType.Ref:
         case TokenType.Shared:
@@ -265,10 +389,13 @@ export class Parser {
         case TokenType.If:
         case TokenType.While:
         case TokenType.Loop:
+        case TokenType.Repeat:
         case TokenType.Return:
         case TokenType.Try:
         case TokenType.Defer:
         case TokenType.Drop:
+        case TokenType.Scope:
+        case TokenType.Dedent:
           return;
         default:
           this.advance();

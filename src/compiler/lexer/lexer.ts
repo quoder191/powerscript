@@ -19,16 +19,44 @@ export class Lexer {
   private tokenStartLine = 1;
   private tokenStartColumn = 1;
 
+  // Indentation & nesting tracking for colon-indented blocks (`if age > 18:\n  ...`)
+  private braceDepth = 0;
+  private parenDepth = 0;
+  private bracketDepth = 0;
+  private atLineStart = true;
+  private readonly indentStack: number[] = [0];
+  private readonly braceStack: Array<{ indentLen: number; allowIndent: boolean }> = [];
+  private readonly delimiterStack: Array<'paren' | 'bracket' | 'braceBlock' | 'braceMap'> = [];
+  private lastSignificantTokenType: TokenType | null = null;
+
   constructor(source: string) {
     this.source = source;
   }
 
   public tokenize(): LexerResult {
     while (!this.isAtEnd()) {
+      const topDelimiter =
+        this.delimiterStack.length > 0
+          ? this.delimiterStack[this.delimiterStack.length - 1]
+          : null;
+      const canHandleIndent = topDelimiter === null || topDelimiter === 'braceBlock';
+      if (this.atLineStart && canHandleIndent) {
+        this.handleLineIndentation();
+        if (this.isAtEnd()) break;
+      }
+
       this.start = this.current;
       this.tokenStartLine = this.line;
       this.tokenStartColumn = this.column;
       this.scanToken();
+    }
+
+    // Close any remaining indentation levels cleanly at EOF
+    while (this.indentStack.length > 1) {
+      this.indentStack.pop();
+      this.tokens.push(
+        createToken(TokenType.Dedent, '', null, this.line, this.column, this.current, this.current)
+      );
     }
 
     this.tokens.push(
@@ -41,38 +69,281 @@ export class Lexer {
     };
   }
 
+  private handleLineIndentation(): void {
+    let spaces = 0;
+    let probe = this.current;
+
+    while (probe < this.source.length) {
+      const ch = this.source[probe];
+      if (ch === ' ') {
+        spaces++;
+        probe++;
+      } else if (ch === '\t') {
+        spaces += 2;
+        probe++;
+      } else {
+        break;
+      }
+    }
+
+    // Ignore blank lines and comment-only lines for indentation changes
+    const nextCh = this.source[probe];
+    const nextNext = this.source[probe + 1];
+    if (
+      nextCh === undefined ||
+      nextCh === '\n' ||
+      nextCh === '\r' ||
+      nextCh === '#' ||
+      (nextCh === '/' && (nextNext === '/' || nextNext === '*'))
+    ) {
+      this.atLineStart = false;
+      return;
+    }
+
+    // Consume leading whitespace on this active line
+    while (this.current < probe) {
+      this.advance();
+    }
+    this.atLineStart = false;
+
+    const currentIndent = this.indentStack[this.indentStack.length - 1];
+    if (spaces > currentIndent && this.lastSignificantTokenType === TokenType.Colon) {
+      this.indentStack.push(spaces);
+      this.tokens.push(
+        createToken(TokenType.Indent, '', null, this.line, this.column, this.current, this.current)
+      );
+    } else if (spaces < currentIndent) {
+      const minIndentLen =
+        this.braceStack.length > 0
+          ? this.braceStack[this.braceStack.length - 1].indentLen
+          : 1;
+      while (
+        this.indentStack.length > minIndentLen &&
+        spaces < this.indentStack[this.indentStack.length - 1]
+      ) {
+        this.indentStack.pop();
+        this.tokens.push(
+          createToken(TokenType.Dedent, '', null, this.line, this.column, this.current, this.current)
+        );
+      }
+    }
+  }
+
+  private popDelimiter(kind: 'paren' | 'bracket' | 'brace'): void {
+    for (let i = this.delimiterStack.length - 1; i >= 0; i--) {
+      const entry = this.delimiterStack[i];
+      const matches =
+        kind === 'brace'
+          ? entry === 'braceBlock' || entry === 'braceMap'
+          : entry === kind;
+      if (matches) {
+        this.delimiterStack.length = i;
+        return;
+      }
+    }
+  }
+
+  private isBlockOpeningBrace(): boolean {
+    // Walk back to the previous non-newline token
+    let idx = this.tokens.length - 1;
+    while (idx >= 0 && this.tokens[idx].type === TokenType.Newline) {
+      idx--;
+    }
+    if (idx < 0) return true;
+
+    const prev = this.tokens[idx].type;
+    if (
+      prev === TokenType.LeftBrace ||
+      prev === TokenType.RightBrace ||
+      prev === TokenType.Semicolon ||
+      prev === TokenType.Indent ||
+      prev === TokenType.Dedent ||
+      prev === TokenType.FatArrow
+    ) {
+      return true;
+    }
+
+    if (
+      prev === TokenType.Assign ||
+      prev === TokenType.PlusAssign ||
+      prev === TokenType.MinusAssign ||
+      prev === TokenType.StarAssign ||
+      prev === TokenType.SlashAssign ||
+      prev === TokenType.Comma ||
+      prev === TokenType.Colon ||
+      prev === TokenType.LeftParen ||
+      prev === TokenType.LeftBracket ||
+      prev === TokenType.Return ||
+      prev === TokenType.Throw ||
+      prev === TokenType.Question ||
+      prev === TokenType.Nullish
+    ) {
+      return false;
+    }
+
+    // Scan backwards to the start of the current statement (respecting paren/bracket nesting)
+    let paren = 0;
+    let bracket = 0;
+    let stmtStart = 0;
+    for (let i = idx; i >= 0; i--) {
+      const t = this.tokens[i].type;
+      if (t === TokenType.RightParen) {
+        paren++;
+      } else if (t === TokenType.LeftParen) {
+        if (paren === 0) {
+          stmtStart = i + 1;
+          break;
+        }
+        paren--;
+      } else if (t === TokenType.RightBracket) {
+        bracket++;
+      } else if (t === TokenType.LeftBracket) {
+        if (bracket === 0) {
+          stmtStart = i + 1;
+          break;
+        }
+        bracket--;
+      }
+
+      if (paren === 0 && bracket === 0) {
+        if (
+          t === TokenType.Semicolon ||
+          t === TokenType.LeftBrace ||
+          t === TokenType.RightBrace ||
+          t === TokenType.Indent ||
+          t === TokenType.Dedent ||
+          t === TokenType.Assign ||
+          t === TokenType.Comma ||
+          t === TokenType.FatArrow
+        ) {
+          stmtStart = i + 1;
+          break;
+        }
+        // Only treat Newline as statement boundary if next token starts a statement
+        if (t === TokenType.Newline && i < idx) {
+          const nextTok = this.tokens[i + 1].type;
+          if (
+            nextTok === TokenType.Class ||
+            nextTok === TokenType.Struct ||
+            nextTok === TokenType.Enum ||
+            nextTok === TokenType.Trait ||
+            nextTok === TokenType.Fn ||
+            nextTok === TokenType.Init ||
+            nextTok === TokenType.Pub ||
+            nextTok === TokenType.Priv ||
+            nextTok === TokenType.Prot ||
+            nextTok === TokenType.Override ||
+            nextTok === TokenType.Static ||
+            nextTok === TokenType.Export ||
+            nextTok === TokenType.If ||
+            nextTok === TokenType.Elif ||
+            nextTok === TokenType.Else ||
+            nextTok === TokenType.For ||
+            nextTok === TokenType.While ||
+            nextTok === TokenType.Loop ||
+            nextTok === TokenType.Repeat ||
+            nextTok === TokenType.Try ||
+            nextTok === TokenType.Catch ||
+            nextTok === TokenType.Scope
+          ) {
+            stmtStart = i + 1;
+            break;
+          }
+        }
+      }
+    }
+
+    while (stmtStart <= idx) {
+      const t = this.tokens[stmtStart].type;
+      if (
+        t === TokenType.Newline ||
+        t === TokenType.Export ||
+        t === TokenType.Pub ||
+        t === TokenType.Priv ||
+        t === TokenType.Prot ||
+        t === TokenType.Override ||
+        t === TokenType.Static
+      ) {
+        stmtStart++;
+        continue;
+      }
+      return (
+        t === TokenType.Class ||
+        t === TokenType.Struct ||
+        t === TokenType.Enum ||
+        t === TokenType.Trait ||
+        t === TokenType.Fn ||
+        t === TokenType.Init ||
+        t === TokenType.If ||
+        t === TokenType.Elif ||
+        t === TokenType.Else ||
+        t === TokenType.For ||
+        t === TokenType.While ||
+        t === TokenType.Loop ||
+        t === TokenType.Repeat ||
+        t === TokenType.Try ||
+        t === TokenType.Catch ||
+        t === TokenType.Scope
+      );
+    }
+    return false;
+  }
+
   private scanToken(): void {
     const c = this.advance();
 
     switch (c) {
-      // Whitespace
       case ' ':
       case '\r':
       case '\t':
         return;
 
-      case '\n': {
+      case '\n':
         this.emitToken(TokenType.Newline, '\n', null);
+        this.atLineStart = true;
         return;
-      }
 
-      // Single-character punctuation
       case '(':
+        this.parenDepth++;
+        this.delimiterStack.push('paren');
         this.emitToken(TokenType.LeftParen);
         return;
       case ')':
+        this.parenDepth = Math.max(0, this.parenDepth - 1);
+        this.popDelimiter('paren');
         this.emitToken(TokenType.RightParen);
         return;
-      case '{':
+      case '{': {
+        const allowIndent = this.isBlockOpeningBrace();
+        this.braceStack.push({ indentLen: this.indentStack.length, allowIndent });
+        this.delimiterStack.push(allowIndent ? 'braceBlock' : 'braceMap');
+        this.braceDepth++;
         this.emitToken(TokenType.LeftBrace);
         return;
-      case '}':
+      }
+      case '}': {
+        const closed = this.braceStack.pop();
+        if (closed) {
+          while (this.indentStack.length > closed.indentLen) {
+            this.indentStack.pop();
+            this.tokens.push(
+              createToken(TokenType.Dedent, '', null, this.line, this.column, this.current, this.current)
+            );
+          }
+        }
+        this.popDelimiter('brace');
+        this.braceDepth = Math.max(0, this.braceDepth - 1);
         this.emitToken(TokenType.RightBrace);
         return;
+      }
       case '[':
+        this.bracketDepth++;
+        this.delimiterStack.push('bracket');
         this.emitToken(TokenType.LeftBracket);
         return;
       case ']':
+        this.bracketDepth = Math.max(0, this.bracketDepth - 1);
+        this.popDelimiter('bracket');
         this.emitToken(TokenType.RightBracket);
         return;
       case ',':
@@ -85,12 +356,10 @@ export class Lexer {
         this.emitToken(TokenType.Percent);
         return;
 
-      // Comments starting with # (Python-style ergonomics)
       case '#':
         this.skipLineComment();
         return;
 
-      // Multi-character operators & punctuation
       case '+':
         if (this.match('+')) {
           this.emitToken(TokenType.PlusPlus);
@@ -167,7 +436,7 @@ export class Lexer {
         } else if (this.match('|')) {
           this.emitToken(TokenType.PipePipe);
         } else {
-          this.reportError(`Unexpected character '|'`, 'Use `|>` for pipelines or `||` / `or` for logical OR.');
+          this.emitToken(TokenType.Pipe);
         }
         return;
 
@@ -193,14 +462,22 @@ export class Lexer {
         this.emitToken(this.match(':') ? TokenType.DoubleColon : TokenType.Colon);
         return;
 
-      // Strings
+      case '`':
+        this.scanMultilineBacktickString();
+        return;
+
       case '"':
       case "'":
-        this.scanString(c, false);
+        if (this.peek() === c && this.peekNext() === c) {
+          this.advance();
+          this.advance();
+          this.scanTripleQuotedString(c);
+          return;
+        }
+        this.scanString(c, true);
         return;
 
       default:
-        // Interpolated f-string: f"..." or f'...'
         if ((c === 'f' || c === 'F') && (this.peek() === '"' || this.peek() === "'")) {
           const quote = this.advance();
           this.scanString(quote, true);
@@ -248,17 +525,89 @@ export class Lexer {
     }
   }
 
-  private scanString(quote: string, isFString: boolean): void {
+  private scanTripleQuotedString(quote: string): void {
+    let value = '';
+    while (!this.isAtEnd()) {
+      if (
+        this.peek() === quote &&
+        this.peekNext() === quote &&
+        this.source[this.current + 2] === quote
+      ) {
+        this.advance();
+        this.advance();
+        this.advance();
+        const isInterpolated = this.hasInterpolation(value);
+        this.emitToken(
+          isInterpolated ? TokenType.FStringLiteral : TokenType.StringLiteral,
+          this.source.slice(this.start, this.current),
+          value
+        );
+        return;
+      }
+      value += this.advance();
+    }
+    this.reportError(
+      'Unterminated multiline string literal',
+      `Add closing ${quote.repeat(3)} delimiter.`
+    );
+  }
+
+  private scanMultilineBacktickString(): void {
+    let value = '';
+    while (!this.isAtEnd()) {
+      const ch = this.peek();
+      if (ch === '`') {
+        this.advance();
+        const isInterpolated = this.hasInterpolation(value);
+        this.emitToken(
+          isInterpolated ? TokenType.FStringLiteral : TokenType.StringLiteral,
+          this.source.slice(this.start, this.current),
+          value
+        );
+        return;
+      }
+      if (ch === '\\' && this.peekNext() === '`') {
+        this.advance();
+        value += this.advance();
+        continue;
+      }
+      value += this.advance();
+    }
+    this.reportError('Unterminated multiline backtick string', 'Add closing ` backtick.');
+  }
+
+  private hasInterpolation(raw: string): boolean {
+    // Detect unescaped `{expr}` interpolation cleanly
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === '\\') {
+        i++;
+        continue;
+      }
+      if (raw[i] === '{') {
+        const rest = raw.slice(i + 1);
+        const closeIdx = rest.indexOf('}');
+        if (closeIdx > 0 && /^[a-zA-Z0-9_$.()+\-*/% '"[\],]+$/.test(rest.slice(0, closeIdx).trim())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private scanString(quote: string, allowInterpolation: boolean): void {
     let value = '';
     let braceDepth = 0;
+    let sawInterpolation = false;
+    const explicitF = this.source[this.start] === 'f' || this.source[this.start] === 'F';
 
     while (!this.isAtEnd()) {
       const ch = this.peek();
 
       if (ch === quote && braceDepth === 0) {
         this.advance();
+        const emitAsF = explicitF || (allowInterpolation && sawInterpolation && this.hasInterpolation(value));
         this.emitToken(
-          isFString ? TokenType.FStringLiteral : TokenType.StringLiteral,
+          emitAsF ? TokenType.FStringLiteral : TokenType.StringLiteral,
           this.source.slice(this.start, this.current),
           value
         );
@@ -289,10 +638,10 @@ export class Lexer {
             value += "'";
             break;
           case '{':
-            value += isFString ? '\\{' : '{';
+            value += '\\{';
             break;
           case '}':
-            value += isFString ? '\\}' : '}';
+            value += '\\}';
             break;
           default:
             value += esc;
@@ -301,22 +650,25 @@ export class Lexer {
         continue;
       }
 
-      if (isFString) {
-        if (ch === '{') braceDepth++;
-        else if (ch === '}' && braceDepth > 0) braceDepth--;
+      if (allowInterpolation) {
+        if (ch === '{') {
+          braceDepth++;
+          sawInterpolation = true;
+        } else if (ch === '}' && braceDepth > 0) {
+          braceDepth--;
+        }
       }
 
       value += this.advance();
     }
 
     this.reportError(
-      isFString ? 'Unterminated f-string literal' : 'Unterminated string literal',
+      explicitF ? 'Unterminated f-string literal' : 'Unterminated string literal',
       `Add closing ${quote} quote.`
     );
   }
 
   private scanNumber(firstChar: string): void {
-    // Support hex (0x) and binary (0b) integers
     if (firstChar === '0' && (this.peek() === 'x' || this.peek() === 'X')) {
       this.advance();
       while (this.isHexDigit(this.peek()) || this.peek() === '_') {
@@ -352,7 +704,6 @@ export class Lexer {
     }
 
     let isFloat = false;
-    // Check decimal point, making sure not to swallow range operator `1..10`
     if (this.peek() === '.' && this.isDigit(this.peekNext())) {
       isFloat = true;
       this.advance();
@@ -361,7 +712,6 @@ export class Lexer {
       }
     }
 
-    // Scientific notation (e.g. 1e5, 2.5e-3)
     if (this.peek() === 'e' || this.peek() === 'E') {
       const next = this.peekNext();
       if (this.isDigit(next) || next === '+' || next === '-') {
@@ -389,6 +739,25 @@ export class Lexer {
     }
 
     const lexeme = this.source.slice(this.start, this.current);
+
+    // Special syntax: `style { ... }` captures raw CSS directly (preserving #colors, units, :hover, etc.)
+    if (lexeme === 'style' && this.lastSignificantTokenType !== TokenType.Dot) {
+      let probe = this.current;
+      while (probe < this.source.length) {
+        const ch = this.source[probe];
+        if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+          probe++;
+        } else {
+          break;
+        }
+      }
+      if (this.source[probe] === '{') {
+        this.emitToken(TokenType.Style, lexeme, lexeme);
+        this.scanStyleBlock();
+        return;
+      }
+    }
+
     const keywordType = lookupKeyword(lexeme);
 
     if (keywordType === TokenType.BoolLiteral) {
@@ -404,11 +773,125 @@ export class Lexer {
     this.emitToken(keywordType ?? TokenType.Identifier, lexeme, lexeme);
   }
 
+  private scanStyleBlock(): void {
+    while (!this.isAtEnd()) {
+      const ch = this.peek();
+      if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+        this.advance();
+      } else {
+        break;
+      }
+    }
+
+    if (this.peek() !== '{') return;
+
+    const blockStartOffset = this.current;
+    const blockStartLine = this.line;
+    const blockStartColumn = this.column;
+    this.advance(); // consume '{'
+
+    const cssStartOffset = this.current;
+    let cssEndOffset = this.current;
+    let depth = 1;
+
+    while (!this.isAtEnd() && depth > 0) {
+      const ch = this.peek();
+
+      // CSS strings
+      if (ch === '"' || ch === "'") {
+        const q = this.advance();
+        while (!this.isAtEnd()) {
+          if (this.peek() === '\\') {
+            this.advance();
+            if (!this.isAtEnd()) this.advance();
+            continue;
+          }
+          if (this.advance() === q) break;
+        }
+        cssEndOffset = this.current;
+        continue;
+      }
+
+      // CSS comments /* ... */
+      if (ch === '/' && this.peekNext() === '*') {
+        this.advance();
+        this.advance();
+        while (!this.isAtEnd() && !(this.peek() === '*' && this.peekNext() === '/')) {
+          this.advance();
+        }
+        if (!this.isAtEnd()) {
+          this.advance();
+          this.advance();
+        }
+        cssEndOffset = this.current;
+        continue;
+      }
+
+      if (ch === '{') {
+        depth++;
+        this.advance();
+        cssEndOffset = this.current;
+        continue;
+      }
+
+      if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          cssEndOffset = this.current;
+          this.advance(); // consume closing '}'
+          break;
+        }
+        this.advance();
+        cssEndOffset = this.current;
+        continue;
+      }
+
+      this.advance();
+      cssEndOffset = this.current;
+    }
+
+    if (depth > 0) {
+      this.tokenStartLine = blockStartLine;
+      this.tokenStartColumn = blockStartColumn;
+      this.reportError('Unterminated style { ... } block', "Add closing '}' for your CSS style block.");
+    }
+
+    const rawCss = this.dedentCssBlock(this.source.slice(cssStartOffset, cssEndOffset));
+    this.atLineStart = false;
+    this.lastSignificantTokenType = TokenType.StyleBlock;
+    this.tokens.push(
+      createToken(
+        TokenType.StyleBlock,
+        this.source.slice(blockStartOffset, this.current),
+        rawCss,
+        blockStartLine,
+        blockStartColumn,
+        blockStartOffset,
+        this.current
+      )
+    );
+  }
+
+  private dedentCssBlock(raw: string): string {
+    const lines = raw.replace(/\r\n/g, '\n').split('\n');
+    while (lines.length > 0 && lines[0].trim() === '') lines.shift();
+    while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+    if (lines.length === 0) return '';
+    const nonEmpty = lines.filter((l) => l.trim().length > 0);
+    const minIndent = Math.min(
+      ...nonEmpty.map((l) => l.match(/^[ \t]*/)?.[0].length ?? 0)
+    );
+    return lines.map((l) => (l.length >= minIndent ? l.slice(minIndent) : l)).join('\n');
+  }
+
   private emitToken(
     type: TokenType,
     lexeme = this.source.slice(this.start, this.current),
     literal: string | number | boolean | null = null
   ): void {
+    if (type !== TokenType.Newline) {
+      this.lastSignificantTokenType = type;
+    }
     this.tokens.push(
       createToken(
         type,

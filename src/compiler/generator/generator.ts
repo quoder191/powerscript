@@ -18,6 +18,20 @@ export interface GeneratorOptions {
   indentSize?: number;
   asyncFunctions?: string[];
   interactiveAsync?: boolean;
+  minify?: boolean;
+  refFunctionParams?: Record<string, boolean[]>;
+}
+
+export interface SourceMapping {
+  generatedLine: number;
+  sourceLine: number;
+  sourceColumn: number;
+  kind: string;
+}
+
+export interface GenerateOutput {
+  code: string;
+  sourceMap: SourceMapping[];
 }
 
 const INTERACTIVE_IO_FUNCTIONS = new Set([
@@ -34,11 +48,20 @@ const INTERACTIVE_IO_FUNCTIONS = new Set([
   'copy',
 ]);
 
+const PRIMITIVE_ALLOC_TYPES = new Set([
+  'int', 'float', 'number', 'double', 'long', 'short', 'char',
+  'str', 'string', 'text', 'bool', 'boolean', 'any', 'ptr',
+]);
+
 export class Generator {
   private readonly indentSize: number;
   private readonly includeRuntime: boolean;
   private readonly asyncFunctions: Set<string>;
   private readonly interactiveAsync: boolean;
+  private readonly minify: boolean;
+  private readonly refFunctionParams: Record<string, boolean[]>;
+  private readonly mappings: SourceMapping[] = [];
+  private readonly scopeRefStack: Array<Map<string, boolean>> = [new Map()];
   private indentLevel = 0;
   private tempCounter = 0;
 
@@ -47,27 +70,154 @@ export class Generator {
     this.indentSize = options.indentSize ?? 2;
     this.asyncFunctions = new Set(options.asyncFunctions ?? []);
     this.interactiveAsync = options.interactiveAsync ?? false;
+    this.minify = options.minify ?? false;
+    this.refFunctionParams = options.refFunctionParams ?? {};
+  }
+
+  private pushRefScope(): void {
+    this.scopeRefStack.push(new Map());
+  }
+
+  private popRefScope(): void {
+    if (this.scopeRefStack.length > 1) {
+      this.scopeRefStack.pop();
+    }
+  }
+
+  private setScopeRef(name: string, isRef: boolean): void {
+    this.scopeRefStack[this.scopeRefStack.length - 1].set(name, isRef);
+  }
+
+  private isRefVar(name: string): boolean {
+    for (let i = this.scopeRefStack.length - 1; i >= 0; i--) {
+      if (this.scopeRefStack[i].has(name)) {
+        return Boolean(this.scopeRefStack[i].get(name));
+      }
+    }
+    return false;
+  }
+
+  private hasSuperCall(block: BlockStatementNode): boolean {
+    const checkExpr = (e?: ExpressionNode): boolean => {
+      if (!e) return false;
+      if (e.kind === 'CallExpression' && e.callee.kind === 'SuperExpression') return true;
+      if (e.kind === 'AssignmentExpression') return checkExpr(e.value);
+      if (e.kind === 'ConditionalExpression') return checkExpr(e.consequent) || checkExpr(e.alternate);
+      return false;
+    };
+    const checkStmts = (stmts: StatementNode[]): boolean => {
+      for (const s of stmts) {
+        if (s.kind === 'ExpressionStatement' && checkExpr(s.expression)) return true;
+        if (s.kind === 'VarDeclaration' && checkExpr(s.initializer)) return true;
+        if (s.kind === 'BlockStatement' && checkStmts(s.statements)) return true;
+      }
+      return false;
+    };
+    return checkStmts(block.statements);
+  }
+
+  private emitAddrOf(target: ExpressionNode, labelName = 'ptr', isConst = false): string {
+    if (target.kind === 'Identifier') {
+      const n = target.name;
+      if (this.isRefVar(n)) {
+        return `__ejs.addrOf(() => ${n}.get(), (__v) => { ${n}.set(__v); }, ${JSON.stringify(n)}, ${isConst})`;
+      }
+      return `__ejs.addrOf(() => ${n}, (__v) => { ${n} = __v; }, ${JSON.stringify(n)}, ${isConst})`;
+    }
+    if (target.kind === 'MemberExpression') {
+      const objVar = this.nextTemp('__obj');
+      const objExpr = this.emitExpression(target.object);
+      const prop = target.property;
+      return `((${objVar}) => __ejs.addrOf(() => ${objVar}.${prop}, (__v) => { ${objVar}.${prop} = __v; }, ${JSON.stringify(`${labelName}.${prop}`)}, ${isConst}))(${objExpr})`;
+    }
+    if (target.kind === 'IndexExpression') {
+      const objVar = this.nextTemp('__arr');
+      const idxVar = this.nextTemp('__idx');
+      const objExpr = this.emitExpression(target.object);
+      const idxExpr = this.emitExpression(target.index);
+      return `((${objVar}, ${idxVar}) => __ejs.addrOf(() => ${objVar}[${idxVar}], (__v) => { ${objVar}[${idxVar}] = __v; }, ${JSON.stringify(`${labelName}[]`)}, ${isConst}))(${objExpr}, ${idxExpr})`;
+    }
+    if (target.kind === 'PointerExpression' && target.op === 'deref') {
+      return this.emitExpression(target.argument);
+    }
+    const valExpr = this.emitExpression(target);
+    return `__ejs.addrOf(() => ${valExpr}, null, ${JSON.stringify(labelName)}, ${isConst})`;
   }
 
   public generate(program: ProgramNode): string {
+    return this.generateWithSourceMap(program).code;
+  }
+
+  public generateWithSourceMap(program: ProgramNode): GenerateOutput {
+    this.mappings.length = 0;
     const lines: string[] = [];
+    let currentGenLine = 1;
 
     if (this.includeRuntime) {
-      lines.push(buildRuntimePrelude().trimEnd());
+      const prelude = buildRuntimePrelude().trimEnd();
+      lines.push(prelude);
+      currentGenLine += prelude.split('\n').length;
     }
 
-    const bodyCode = this.emitStatements(program.body);
-    if (bodyCode.length > 0) {
-      if (this.includeRuntime) {
-        lines.push('{');
-        lines.push(bodyCode);
-        lines.push('}');
-      } else {
-        lines.push(bodyCode);
-      }
+    const bodyLines: string[] = [];
+    if (this.includeRuntime) {
+      bodyLines.push('{');
+      currentGenLine++;
     }
 
-    return lines.join('\n').trimEnd() + '\n';
+    for (const stmt of program.body) {
+      const emitted = this.emitStatement(stmt);
+      const stmtLines = emitted.split('\n');
+      this.mappings.push({
+        generatedLine: currentGenLine,
+        sourceLine: stmt.line,
+        sourceColumn: stmt.column,
+        kind: stmt.kind,
+      });
+      bodyLines.push(emitted);
+      currentGenLine += stmtLines.length;
+    }
+
+    if (this.includeRuntime) {
+      bodyLines.push('}');
+    }
+
+    if (program.body.length > 0) {
+      lines.push(bodyLines.join('\n'));
+    }
+
+    let code = lines.join('\n').trimEnd() + '\n';
+    if (this.minify) {
+      code = this.minifyUserSection(code);
+    }
+
+    return {
+      code,
+      sourceMap: [...this.mappings],
+    };
+  }
+
+  private minifyUserSection(fullCode: string): string {
+    const marker = '// --- EasyJS Program ---';
+    const minifyChunk = (src: string) =>
+      src
+        .replace(/\/\/[^\n]*/g, '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s*([{}:;,()[\]=+\-*/<>!&|?]+)\s*/g, '$1')
+        .replace(/\b(let|const|function|return|if|else|for|while|new|class|extends|async|await|throw|catch|of)\b/g, ' $1 ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (fullCode.includes(marker)) {
+      const idx = fullCode.indexOf(marker);
+      const head = fullCode.slice(0, idx + marker.length);
+      const body = fullCode.slice(idx + marker.length);
+      return `${head}\n${minifyChunk(body)}\n`;
+    }
+    return minifyChunk(fullCode) + '\n';
   }
 
   private indent(): string {
@@ -144,12 +294,39 @@ export class Generator {
     switch (stmt.kind) {
       case 'VarDeclaration': {
         const keyword = stmt.mutable ? 'let' : 'const';
+        if (stmt.pointerMode === 'cpp_ref') {
+          const refInit = stmt.initializer
+            ? this.emitAddrOf(stmt.initializer, stmt.name, Boolean(stmt.typeAnnotation?.isConst))
+            : `__ejs.addrOf(() => null, null, ${JSON.stringify(stmt.name)}, ${Boolean(stmt.typeAnnotation?.isConst)})`;
+          this.setScopeRef(stmt.name, true);
+          return `${pad}const ${stmt.name} = ${refInit};`;
+        }
+
+        this.setScopeRef(stmt.name, false);
+
         if (!stmt.initializer) {
+          if (stmt.pointerMode === 'ptr' || stmt.pointerMode === 'unique' || stmt.pointerMode === 'weak') {
+            return `${pad}${keyword} ${stmt.name} = null;`;
+          }
           if (stmt.typeAnnotation) {
             return `${pad}${keyword} ${stmt.name} = ${this.defaultValueForType(stmt.typeAnnotation.name)};`;
           }
           return `${pad}${keyword} ${stmt.name};`;
         }
+
+        if (
+          stmt.pointerMode === 'ptr' &&
+          stmt.initializer.kind === 'PointerExpression' &&
+          (stmt.initializer.op === 'addr' || stmt.initializer.op === 'borrow')
+        ) {
+          const ptrInit = this.emitAddrOf(
+            stmt.initializer.argument,
+            stmt.name,
+            Boolean(stmt.typeAnnotation?.isConst)
+          );
+          return `${pad}${keyword} ${stmt.name} = ${ptrInit};`;
+        }
+
         let initExpr = this.emitExpression(stmt.initializer);
         if (
           stmt.pointerMode === 'own' &&
@@ -161,11 +338,15 @@ export class Generator {
           stmt.initializer.kind !== 'PointerExpression'
         ) {
           initExpr = `__ejs.share(${initExpr}, ${JSON.stringify(stmt.name)})`;
-        } else if (
-          stmt.pointerMode === 'ref' &&
-          stmt.initializer.kind !== 'PointerExpression'
-        ) {
-          initExpr = `__ejs.borrow(${initExpr}, ${JSON.stringify(stmt.name)})`;
+        } else if (stmt.pointerMode === 'ref') {
+          if (
+            stmt.initializer.kind === 'PointerExpression' &&
+            (stmt.initializer.op === 'borrow' || stmt.initializer.op === 'addr')
+          ) {
+            initExpr = `__ejs.borrow(${this.emitExpression(stmt.initializer.argument)}, ${JSON.stringify(stmt.name)})`;
+          } else if (stmt.initializer.kind !== 'PointerExpression') {
+            initExpr = `__ejs.borrow(${initExpr}, ${JSON.stringify(stmt.name)})`;
+          }
         } else if (stmt.initializer.kind === 'PointerExpression') {
           if (stmt.initializer.op === 'own') {
             initExpr = `__ejs.own(${this.emitExpression(stmt.initializer.argument)}, ${JSON.stringify(stmt.name)})`;
@@ -178,6 +359,18 @@ export class Generator {
           }
         }
         return `${pad}${keyword} ${stmt.name} = ${initExpr};`;
+      }
+
+      case 'MultiVarDeclaration':
+        return stmt.declarations.map((d) => this.emitStatement(d)).join('\n');
+
+      case 'ImportStatement': {
+        const modExpr = `__ejs.loadModule(${JSON.stringify(stmt.modulePath)})`;
+        if (stmt.namedImports.length > 0) {
+          return `${pad}const { ${stmt.namedImports.join(', ')} } = ${modExpr};`;
+        }
+        const bindName = stmt.alias ?? stmt.defaultImport ?? 'mod';
+        return `${pad}const ${bindName} = ${modExpr};`;
       }
 
       case 'FunctionDeclaration':
@@ -210,23 +403,39 @@ export class Generator {
         return lines.join('\n');
       }
 
-      case 'ForInStatement':
-        return `${pad}for (const ${stmt.variable} of __ejs.iter(${this.emitExpression(stmt.iterable)})) ${this.emitInlineBlock(stmt.body)}`;
+      case 'ForInStatement': {
+        this.pushRefScope();
+        this.setScopeRef(stmt.variable, false);
+        const out = `${pad}for (const ${stmt.variable} of __ejs.iter(${this.emitExpression(stmt.iterable)})) ${this.emitInlineBlock(stmt.body)}`;
+        this.popRefScope();
+        return out;
+      }
 
       case 'CForStatement': {
+        this.pushRefScope();
         const initStr = stmt.init
           ? this.emitStatement(stmt.init).trim().replace(/;$/, '')
           : '';
         const condStr = stmt.condition ? this.emitExpression(stmt.condition) : '';
         const updStr = stmt.update ? this.emitExpression(stmt.update) : '';
-        return `${pad}for (${initStr}; ${condStr}; ${updStr}) ${this.emitInlineBlock(stmt.body)}`;
+        const out = `${pad}for (${initStr}; ${condStr}; ${updStr}) ${this.emitInlineBlock(stmt.body)}`;
+        this.popRefScope();
+        return out;
       }
 
       case 'WhileStatement':
         return `${pad}while (${this.emitExpression(stmt.condition)}) ${this.emitInlineBlock(stmt.body)}`;
 
+      case 'DoWhileStatement':
+        return `${pad}do ${this.emitInlineBlock(stmt.body)} while (${this.emitExpression(stmt.condition)});`;
+
       case 'LoopStatement':
         return `${pad}while (true) ${this.emitInlineBlock(stmt.body)}`;
+
+      case 'RepeatStatement': {
+        const idxVar = this.nextTemp('__rep');
+        return `${pad}for (let ${idxVar} = 0; ${idxVar} < (${this.emitExpression(stmt.count)}); ${idxVar}++) ${this.emitInlineBlock(stmt.body)}`;
+      }
 
       case 'ReturnStatement':
         return stmt.value
@@ -241,7 +450,12 @@ export class Generator {
 
       case 'TryCatchStatement': {
         const catchBinding = stmt.catchVar ? `(${stmt.catchVar})` : '';
-        return `${pad}try ${this.emitInlineBlock(stmt.tryBlock)} catch ${catchBinding} ${this.emitInlineBlock(stmt.catchBlock)}`;
+        const tryStr = this.emitInlineBlock(stmt.tryBlock);
+        this.pushRefScope();
+        if (stmt.catchVar) this.setScopeRef(stmt.catchVar, false);
+        const catchStr = this.emitInlineBlock(stmt.catchBlock);
+        this.popRefScope();
+        return `${pad}try ${tryStr} catch ${catchBinding} ${catchStr}`;
       }
 
       case 'ThrowStatement':
@@ -251,12 +465,15 @@ export class Generator {
         return `${pad}${this.emitStatement(stmt.statement).trimStart()}`;
 
       case 'DropStatement':
-        return `${pad}__ejs.drop(${this.emitExpression(stmt.target)});`;
+        return `${pad}__ejs.drop(${this.emitExpression(stmt.target)}, ${Boolean(stmt.isArrayDelete)});`;
 
       case 'ScopeStatement': {
         const label = stmt.name ? `${pad}// scope ${stmt.name}\n` : '';
         return `${label}${this.emitBlock(stmt.body)}`;
       }
+
+      case 'StyleStatement':
+        return `${pad}__ejs.yourgui.css(${JSON.stringify(stmt.css)});`;
 
       case 'ExpressionStatement':
         return `${pad}${this.emitExpression(stmt.expression)};`;
@@ -265,11 +482,18 @@ export class Generator {
 
   private emitFunctionDecl(fn: FunctionDeclarationNode): string {
     const pad = this.indent();
+    this.pushRefScope();
+    for (const p of fn.params) {
+      this.setScopeRef(p.name, Boolean(p.typeAnnotation?.isReference));
+    }
     const params = this.emitParams(fn.params);
     const prefix = fn.isExported ? 'export ' : '';
-    const asyncKw =
-      this.interactiveAsync && this.asyncFunctions.has(fn.name) ? 'async ' : '';
-    return `${pad}${prefix}${asyncKw}function ${fn.name}(${params}) ${this.emitInlineBlock(fn.body)}`;
+    const blockCode = this.emitInlineBlock(fn.body, false);
+    this.popRefScope();
+    const needsAsync =
+      this.interactiveAsync && (this.asyncFunctions.has(fn.name) || blockCode.includes('(await '));
+    const asyncKw = needsAsync ? 'async ' : '';
+    return `${pad}${prefix}${asyncKw}function ${fn.name}(${params}) ${blockCode}`;
   }
 
   private emitClassDecl(cls: ClassDeclarationNode): string {
@@ -280,16 +504,34 @@ export class Generator {
 
     const innerPad = this.indent();
     for (const field of cls.fields) {
+      if (!field.initializer && !field.isStatic) continue;
       const staticKw = field.isStatic ? 'static ' : '';
       const init = field.initializer ? ` = ${this.emitExpression(field.initializer)}` : '';
       lines.push(`${innerPad}${staticKw}${field.name}${init};`);
     }
 
     for (const method of cls.methods) {
+      this.pushRefScope();
+      for (const p of method.params) {
+        this.setScopeRef(p.name, Boolean(p.typeAnnotation?.isReference));
+      }
       const staticKw = method.isStatic ? 'static ' : '';
       const methodName = method.isConstructor ? 'constructor' : method.name;
       const params = this.emitParams(method.params);
-      lines.push(`${innerPad}${staticKw}${methodName}(${params}) ${this.emitInlineBlock(method.body)}`);
+      let blockCode = this.emitInlineBlock(method.body, false);
+      if (method.isConstructor && cls.superClass && !this.hasSuperCall(method.body)) {
+        if (blockCode === '{}') {
+          blockCode = '{ super(); }';
+        } else {
+          blockCode = blockCode.replace(/^\{\n?/, `{\n${innerPad}  super();\n`);
+        }
+      }
+      this.popRefScope();
+      const asyncKw =
+        this.interactiveAsync && !method.isConstructor && blockCode.includes('(await ')
+          ? 'async '
+          : '';
+      lines.push(`${innerPad}${staticKw}${asyncKw}${methodName}(${params}) ${blockCode}`);
     }
 
     this.indentLevel--;
@@ -328,8 +570,14 @@ export class Generator {
     lines.push(`${innerPad}}`);
 
     for (const method of st.methods) {
+      this.pushRefScope();
+      for (const p of method.params) {
+        this.setScopeRef(p.name, Boolean(p.typeAnnotation?.isReference));
+      }
       const params = this.emitParams(method.params);
-      lines.push(`${innerPad}${method.name}(${params}) ${this.emitInlineBlock(method.body)}`);
+      const blockCode = this.emitInlineBlock(method.body, false);
+      this.popRefScope();
+      lines.push(`${innerPad}${method.name}(${params}) ${blockCode}`);
     }
 
     this.indentLevel--;
@@ -362,21 +610,25 @@ export class Generator {
     return lines.join('\n');
   }
 
-  private emitBlock(block: BlockStatementNode): string {
+  private emitBlock(block: BlockStatementNode, createScope = true): string {
     const pad = this.indent();
     if (block.statements.length === 0) return `${pad}{}`;
+    if (createScope) this.pushRefScope();
     this.indentLevel++;
     const body = this.emitStatements(block.statements);
     this.indentLevel--;
+    if (createScope) this.popRefScope();
     return `${pad}{\n${body}\n${pad}}`;
   }
 
-  private emitInlineBlock(block: BlockStatementNode): string {
+  private emitInlineBlock(block: BlockStatementNode, createScope = true): string {
     const pad = this.indent();
     if (block.statements.length === 0) return '{}';
+    if (createScope) this.pushRefScope();
     this.indentLevel++;
     const body = this.emitStatements(block.statements);
     this.indentLevel--;
+    if (createScope) this.popRefScope();
     return `{\n${body}\n${pad}}`;
   }
 
@@ -391,7 +643,7 @@ export class Generator {
   private emitExpression(expr: ExpressionNode): string {
     switch (expr.kind) {
       case 'Identifier':
-        return expr.name;
+        return this.isRefVar(expr.name) ? `${expr.name}.get()` : expr.name;
 
       case 'SelfExpression':
         return 'this';
@@ -438,6 +690,9 @@ export class Generator {
         if (expr.operator === 'not in') {
           return `(!__ejs.has(${this.emitExpression(expr.right)}, ${this.emitExpression(expr.left)}))`;
         }
+        if (expr.operator === '+') {
+          return `__ejs.ptrAdd(${this.emitExpression(expr.left)}, ${this.emitExpression(expr.right)})`;
+        }
         const op =
           expr.operator === '=='
             ? '==='
@@ -459,10 +714,22 @@ export class Generator {
         return `(${this.emitExpression(expr.left)} ${op} ${this.emitExpression(expr.right)})`;
       }
 
+      case 'ConditionalExpression':
+        return `(${this.emitExpression(expr.condition)} ? ${this.emitExpression(expr.consequent)} : ${this.emitExpression(expr.alternate)})`;
+
       case 'UnaryExpression':
         return `(${expr.operator}${this.emitExpression(expr.operand)})`;
 
       case 'UpdateExpression': {
+        if (expr.argument.kind === 'Identifier' && this.isRefVar(expr.argument.name)) {
+          const n = expr.argument.name;
+          const delta = expr.operator === '++' ? '+ 1' : '- 1';
+          if (expr.prefix) {
+            return `${n}.set(${n}.get() ${delta})`;
+          }
+          const tmp = this.nextTemp('__old');
+          return `((${tmp}) => (${n}.set(${tmp} ${delta}), ${tmp}))(${n}.get())`;
+        }
         const target = this.emitExpression(expr.argument);
         return expr.prefix ? `${expr.operator}${target}` : `${target}${expr.operator}`;
       }
@@ -477,11 +744,26 @@ export class Generator {
           const rawOp = expr.operator.slice(0, -1);
           return `__ejs.setDeref(${ptrExpr}, __ejs.deref(${ptrExpr}) ${rawOp} ${valExpr})`;
         }
+        if (expr.target.kind === 'Identifier' && this.isRefVar(expr.target.name)) {
+          const n = expr.target.name;
+          const valExpr = this.emitExpression(expr.value);
+          if (expr.operator === '=') {
+            return `${n}.set(${valExpr})`;
+          }
+          const rawOp = expr.operator.slice(0, -1);
+          return `${n}.set(${n}.get() ${rawOp} ${valExpr})`;
+        }
         return `${this.emitExpression(expr.target)} ${expr.operator} ${this.emitExpression(expr.value)}`;
       }
 
       case 'CallExpression': {
-        const argsList = expr.args.map((a) => this.emitExpression(a)).join(', ');
+        const refMask =
+          expr.callee.kind === 'Identifier' ? this.refFunctionParams[expr.callee.name] : undefined;
+        const argsList = expr.args
+          .map((a, idx) =>
+            refMask?.[idx] ? this.emitAddrOf(a, `arg${idx}`, false) : this.emitExpression(a)
+          )
+          .join(', ');
 
         if (expr.callee.kind === 'MemberExpression') {
           if (
@@ -492,7 +774,17 @@ export class Generator {
           }
           const objExpr = this.emitExpression(expr.callee.object);
           const methodLit = JSON.stringify(expr.callee.property);
-          return `__ejs.call(${objExpr}, ${methodLit}, [${argsList}], ${expr.callee.optional})`;
+          const callStr = `__ejs.call(${objExpr}, ${methodLit}, [${argsList}], ${expr.callee.optional})`;
+          if (
+            this.interactiveAsync &&
+            expr.callee.object.kind === 'Identifier' &&
+            ((expr.callee.object.name === 'server' && expr.callee.property === 'request') ||
+              (expr.callee.object.name === 'http' &&
+                (expr.callee.property === 'get' || expr.callee.property === 'post')))
+          ) {
+            return `(await ${callStr})`;
+          }
+          return callStr;
         }
 
         if (expr.callee.kind === 'Identifier') {
@@ -518,8 +810,16 @@ export class Generator {
       case 'IndexExpression':
         return `${this.emitExpression(expr.object)}[${this.emitExpression(expr.index)}]`;
 
-      case 'NewExpression':
+      case 'NewExpression': {
+        if (expr.countExpr) {
+          return `__ejs.allocArray(${this.emitExpression(expr.countExpr)}, ${JSON.stringify(expr.className)})`;
+        }
+        if (PRIMITIVE_ALLOC_TYPES.has(expr.className)) {
+          const valArg = expr.args.length > 0 ? this.emitExpression(expr.args[0]) : this.defaultValueForType(expr.className);
+          return `__ejs.allocSingle(${valArg}, ${JSON.stringify(expr.className)})`;
+        }
         return `new ${expr.className}(${expr.args.map((a) => this.emitExpression(a)).join(', ')})`;
+      }
 
       case 'StructInitExpression': {
         const fields = expr.fields
@@ -529,11 +829,21 @@ export class Generator {
       }
 
       case 'LambdaExpression': {
-        const params = this.emitParams(expr.params);
-        if (expr.body.kind === 'BlockStatement') {
-          return `(${params}) => ${this.emitInlineBlock(expr.body)}`;
+        this.pushRefScope();
+        for (const p of expr.params) {
+          this.setScopeRef(p.name, Boolean(p.typeAnnotation?.isReference));
         }
-        return `(${params}) => ${this.emitExpression(expr.body)}`;
+        const params = this.emitParams(expr.params);
+        let bodyStr =
+          expr.body.kind === 'BlockStatement'
+            ? this.emitInlineBlock(expr.body, false)
+            : this.emitExpression(expr.body);
+        this.popRefScope();
+        if (expr.body.kind === 'MapLiteral') {
+          bodyStr = `(${bodyStr})`;
+        }
+        const asyncKw = this.interactiveAsync && bodyStr.includes('(await ') ? 'async ' : '';
+        return `${asyncKw}(${params}) => ${bodyStr}`;
       }
 
       case 'RangeExpression':
@@ -543,18 +853,23 @@ export class Generator {
         return `${this.emitExpression(expr.right)}(${this.emitExpression(expr.left)})`;
 
       case 'PointerExpression': {
-        const arg = this.emitExpression(expr.argument);
         switch (expr.op) {
           case 'own':
-            return `__ejs.own(${arg})`;
+            return `__ejs.own(${this.emitExpression(expr.argument)})`;
           case 'shared':
-            return `__ejs.share(${arg})`;
+            return `__ejs.share(${this.emitExpression(expr.argument)})`;
           case 'borrow':
-            return `__ejs.borrow(${arg})`;
+            return `__ejs.borrow(${this.emitExpression(expr.argument)})`;
           case 'move':
-            return `__ejs.move(${arg})`;
+            return `__ejs.move(${this.emitExpression(expr.argument)})`;
           case 'deref':
-            return `__ejs.deref(${arg})`;
+            return `__ejs.deref(${this.emitExpression(expr.argument)})`;
+          case 'addr':
+            return this.emitAddrOf(expr.argument, 'ptr', false);
+          case 'sizeof':
+            return expr.sizeofTypeName
+              ? `__ejs.sizeof(${JSON.stringify(expr.sizeofTypeName)})`
+              : `__ejs.sizeof(${this.emitExpression(expr.argument)})`;
         }
       }
 
@@ -619,3 +934,11 @@ export class Generator {
 export function generate(program: ProgramNode, options?: GeneratorOptions): string {
   return new Generator(options).generate(program);
 }
+
+export function generateWithSourceMap(
+  program: ProgramNode,
+  options?: GeneratorOptions
+): GenerateOutput {
+  return new Generator(options).generateWithSourceMap(program);
+}
+

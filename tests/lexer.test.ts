@@ -87,6 +87,47 @@ export function runLexerTests(): TestCaseResult[] {
         expectEqual(types.includes(TokenType.Fn), true, 'function -> Fn token');
       },
     },
+    {
+      name: 'Emits Indent and Dedent tokens for colon-indented blocks and nested braces',
+      fn: () => {
+        const src = `class Box {\n  init(x) {\n    if x > 0:\n      if x > 10:\n        print("big")\n      else:\n        print("small")\n  }\n}`;
+        const res = tokenize(src);
+        expectEqual(res.diagnostics.length, 0, 'diagnostics');
+        const indents = res.tokens.filter((t) => t.type === TokenType.Indent).length;
+        const dedents = res.tokens.filter((t) => t.type === TokenType.Dedent).length;
+        expectEqual(indents, 3, 'indent count inside braced init');
+        expectEqual(dedents, 3, 'balanced dedent count');
+      },
+    },
+    {
+      name: 'Tokenizes repeat/times, from, interface, constructor, and multiline triple-quoted strings',
+      fn: () => {
+        const res = tokenize('import math from "stdlib/math"\ninterface IRun { fn go() }\nrepeat 3 times:\n  s = """multi\nline {1 + 1}"""');
+        expectEqual(res.diagnostics.length, 0, 'diagnostics');
+        const types = res.tokens.map((t) => t.type);
+        expectEqual(types.includes(TokenType.Repeat), true, 'repeat');
+        expectEqual(types.includes(TokenType.Times), true, 'times');
+        expectEqual(types.includes(TokenType.From), true, 'from');
+        expectEqual(types.includes(TokenType.Trait), true, 'interface -> Trait');
+        expectEqual(types.includes(TokenType.FStringLiteral), true, 'interpolated multiline');
+      },
+    },
+    {
+      name: 'Tokenizes style { ... } CSS blocks preserving #hex colors and arrow tokens',
+      fn: () => {
+        const src = `# top comment\nstyle {\n  body { background: #111; color: white; }\n  #card:hover { border: 1px solid #2563eb; }\n}\nfn sq(x: int) -> int => x * x\nres = [1, 2] |> map(x => x * 2)`;
+        const res = tokenize(src);
+        expectEqual(res.diagnostics.length, 0, 'diagnostics');
+        const types = res.tokens.map((t) => t.type);
+        expectEqual(types.includes(TokenType.Style), true, 'style keyword');
+        const blockTok = res.tokens.find((t) => t.type === TokenType.StyleBlock);
+        expectEqual(Boolean(blockTok && String(blockTok.literal).includes('#111')), true, 'preserves CSS #111');
+        expectEqual(Boolean(blockTok && String(blockTok.literal).includes('#2563eb')), true, 'preserves CSS #2563eb');
+        expectEqual(types.includes(TokenType.Arrow), true, '-> return arrow');
+        expectEqual(types.includes(TokenType.FatArrow), true, '=> fat arrow');
+        expectEqual(types.includes(TokenType.PipeArrow), true, '|> pipe arrow');
+      },
+    },
   ];
 
   return tests.map((t) => {
