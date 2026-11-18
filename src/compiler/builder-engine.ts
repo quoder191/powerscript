@@ -257,20 +257,76 @@ export function buildBrowserSandboxDocument(
     };
   })();
 
-  const DANGEROUS_PORTS = new Set([20,21,22,23,25,53,69,110,111,135,137,138,139,143,389,445,465,587,636,993,995,1433,1521,2049,2375,2376,3306,3389,5432,5900,6379,8086,9200,11211,27017]);
+  const DANGEROUS_PORTS = new Set([20,21,22,23,25,53,69,110,111,135,137,138,139,143,389,445,465,587,636,993,995,1433,1521,2049,2375,2376,2379,2380,3306,3389,4001,5432,5900,6379,6443,8086,8500,9090,9100,9200,10250,10255,11211,27017,27018,50070]);
+  const BLOCKED_HOSTS = new Set(['localhost','localhost.localdomain','ip6-localhost','ip6-loopback','metadata','metadata.google.internal','metadata.goog','instance-data','localtest.me','lvh.me','vcap.me']);
+  const BLOCKED_SUFFIXES = ['.localhost','.local','.internal','.lan','.home','.corp','.intranet','.arpa','.localdomain','.nip.io','.sslip.io','.xip.io','.localtest.me','.lvh.me','.vcap.me'];
+  const parseV4 = (ip) => {
+    const m = ip.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/);
+    if (!m) return null;
+    let val = 0;
+    for (let i = 1; i <= 4; i++) {
+      if (m[i].length > 1 && m[i].startsWith('0')) return null;
+      const o = Number(m[i]);
+      if (!Number.isInteger(o) || o < 0 || o > 255) return null;
+      val = ((val << 8) | o) >>> 0;
+    }
+    return val;
+  };
+  const isPrivateV4Int = (addr) => {
+    const a = (addr >>> 24) & 0xff, b = (addr >>> 16) & 0xff, c = (addr >>> 8) & 0xff;
+    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 192 && b === 88 && c === 99) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113) || a >= 224;
+  };
+  const isPrivateV6 = (raw) => {
+    let ip = raw.trim().toLowerCase().replace(/^\\[|\\]$/g, '');
+    if (!ip || ip.includes('%')) return true;
+    const lc = ip.lastIndexOf(':');
+    if (lc !== -1 && ip.slice(lc + 1).includes('.')) {
+      const v4 = parseV4(ip.slice(lc + 1));
+      if (v4 === null) return true;
+      ip = ip.slice(0, lc + 1) + (((v4 >>> 16) & 0xffff).toString(16)) + ':' + ((v4 & 0xffff).toString(16));
+    }
+    const dbl = ip.split('::');
+    if (dbl.length > 2) return true;
+    const parseSide = (s) => {
+      if (!s) return [];
+      const gs = s.split(':');
+      const out = [];
+      for (const g of gs) {
+        if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+        out.push(parseInt(g, 16));
+      }
+      return out;
+    };
+    let w;
+    if (dbl.length === 1) {
+      w = parseSide(dbl[0]);
+      if (!w || w.length !== 8) return true;
+    } else {
+      const l = parseSide(dbl[0]), r = parseSide(dbl[1]);
+      if (!l || !r || 8 - (l.length + r.length) < 1) return true;
+      w = [...l, ...new Array(8 - (l.length + r.length)).fill(0), ...r];
+    }
+    const zp = (n) => { for (let i = 0; i < n; i++) if (w[i] !== 0) return false; return true; };
+    if (zp(7) && (w[7] === 0 || w[7] === 1)) return true;
+    if (zp(5) && w[5] === 0xffff) return isPrivateV4Int(((w[6] << 16) | w[7]) >>> 0);
+    if (zp(6)) return isPrivateV4Int(((w[6] << 16) | w[7]) >>> 0);
+    if (w[0] === 0x0064 && w[1] === 0xff9b && (w[2] === 0x0001 || (w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0 && isPrivateV4Int(((w[6] << 16) | w[7]) >>> 0)))) return true;
+    if (w[0] === 0x2002 && isPrivateV4Int(((w[1] << 16) | w[2]) >>> 0)) return true;
+    if (w[0] === 0x2001 && (w[1] === 0 || w[1] === 0x0db8)) return true;
+    if (w[0] === 0x0100 && w[1] === 0 && w[2] === 0 && w[3] === 0) return true;
+    if ((w[0] & 0xfe00) === 0xfc00 || (w[0] & 0xffc0) === 0xfe80 || (w[0] & 0xffc0) === 0xfec0 || (w[0] & 0xff00) === 0xff00) return true;
+    return false;
+  };
   const isPrivateHost = (hostname) => {
-    const h = String(hostname || '').trim().toLowerCase().replace(/^\\[|\\]$/g, '');
-    if (!h) return true;
-    if (h === 'localhost' || h === 'ip6-localhost' || h === 'ip6-loopback' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+    const h = String(hostname || '').trim().toLowerCase().replace(/^\\[|\\]$/g, '').replace(/\\.+$/, '');
+    if (!h || h.includes('%')) return true;
+    if (BLOCKED_HOSTS.has(h) || BLOCKED_SUFFIXES.some((s) => h.endsWith(s))) return true;
     if (/^\\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h)) return true;
-    const m = h.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/);
-    if (m) {
-      const a = Number(m[1]), b = Number(m[2]);
-      if (a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224) return true;
+    if (/^(?:0[0-7]+|0x[0-9a-f]+|\\d+)(?:\\.(?:0[0-7]+|0x[0-9a-f]+|\\d+)){0,3}$/i.test(h)) {
+      const v4 = parseV4(h);
+      return v4 === null || isPrivateV4Int(v4);
     }
-    if (h.includes(':')) {
-      if (h === '::' || h === '::1' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80') || h.startsWith('::ffff:127.') || h.startsWith('::ffff:10.') || h.startsWith('::ffff:192.168.') || h.startsWith('::ffff:169.254.')) return true;
-    }
+    if (h.includes(':')) return isPrivateV6(h);
     return false;
   };
 
@@ -311,7 +367,8 @@ export function buildBrowserSandboxDocument(
       const entries = typeof opts.headers.entries === 'function' ? Array.from(opts.headers.entries()) : Object.entries(opts.headers);
       for (const pair of entries) {
         const k = String(pair[0] || '').trim();
-        if (blocked.has(k.toLowerCase())) {
+        const kl = k.toLowerCase();
+        if (blocked.has(kl) || kl.includes('cookie')) {
           throw new Error('SecurityError: Sensitive header ' + k + ' is blocked by security policy.');
         }
         cleanHeaders[k] = String(pair[1]);
@@ -334,6 +391,9 @@ export function buildBrowserSandboxDocument(
       });
     } finally {
       if (timer) clearTimeout(timer);
+    }
+    if (NET_POLICY.maxRedirects === 0 && res.status >= 300 && res.status < 400) {
+      throw new Error('SecurityError: HTTP redirect (' + res.status + ') blocked by SSRF policy.');
     }
     const safeHeaders = new Headers();
     if (res.headers && typeof res.headers.forEach === 'function') {

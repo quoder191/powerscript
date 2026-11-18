@@ -12,7 +12,7 @@ import { TokenType } from '../lexer/tokens.ts';
 import type { Parser } from './parser.ts';
 
 export function parseExpression(p: Parser): ExpressionNode {
-  return parseAssignment(p);
+  return p.withRecursionLimit(() => parseAssignment(p));
 }
 
 function parseAssignment(p: Parser): ExpressionNode {

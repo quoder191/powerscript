@@ -16,11 +16,14 @@ export interface ParseResult {
   diagnostics: CompilerDiagnostic[];
 }
 
+const MAX_PARSER_RECURSION_DEPTH = 200;
+
 export class Parser {
   private readonly tokens: Token[];
   public readonly diagnostics: CompilerDiagnostic[] = [];
   public allowStructInit = true;
   private current = 0;
+  private recursionDepth = 0;
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
@@ -337,6 +340,22 @@ export class Parser {
 
   public error(token: Token, message: string, hint?: string): ParserError {
     return new ParserError(message, token.line, token.column, hint);
+  }
+
+  public withRecursionLimit<T>(fn: () => T): T {
+    if (this.recursionDepth >= MAX_PARSER_RECURSION_DEPTH) {
+      throw this.error(
+        this.peek(),
+        `Maximum nesting depth (${MAX_PARSER_RECURSION_DEPTH}) exceeded.`,
+        'Reduce deeply nested expressions or blocks.'
+      );
+    }
+    this.recursionDepth += 1;
+    try {
+      return fn();
+    } finally {
+      this.recursionDepth -= 1;
+    }
   }
 
   public peekNonNewline(offset = 1): Token {

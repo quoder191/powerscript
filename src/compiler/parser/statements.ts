@@ -141,6 +141,13 @@ export function parseBlockStatement(
   p: Parser,
   contextLabel = 'statement'
 ): BlockStatementNode {
+  return p.withRecursionLimit(() => parseBlockStatementInner(p, contextLabel));
+}
+
+function parseBlockStatementInner(
+  p: Parser,
+  contextLabel = 'statement'
+): BlockStatementNode {
   if (
     p.check(TokenType.Newline) &&
     (p.peekNonNewline(0).type === TokenType.LeftBrace || p.peekNonNewline(0).type === TokenType.Colon)

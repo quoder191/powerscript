@@ -61,6 +61,12 @@ export {
 export {
     SecurityPolicyManager,
     NetworkPolicyManager,
+    isPrivateOrLoopbackHost,
+    isPrivateOrReservedIp,
+    isPrivateOrReservedIpv4,
+    isPrivateOrReservedIpv6,
+    parseCanonicalIpv4,
+    parseCanonicalIpv6,
     DEFAULT_COMPILER_SECURITY_POLICY,
     DEFAULT_NETWORK_SECURITY_POLICY,
     DEFAULT_GLOBAL_ACCESS_POLICY,

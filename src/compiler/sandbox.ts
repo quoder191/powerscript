@@ -83,25 +83,45 @@ function createPolicyBoundedFetch(networkPolicy: CompilerSecurityPolicy['network
   }) as typeof fetch;
 }
 
+const MAX_SANDBOX_LOG_LINES = 2000;
+const MAX_SANDBOX_LOG_LINE_CHARS = 4096;
+const MAX_SANDBOX_TOTAL_LOG_CHARS = 262_144;
+
 function createCapturedConsole(
   logs: string[],
   onLog?: (line: string) => void
 ): Record<string, (...args: unknown[]) => void> {
+  let totalChars = 0;
+  let truncatedNoticeSent = false;
+
+  const pushLine = (rawLine: string) => {
+    if (logs.length >= MAX_SANDBOX_LOG_LINES || totalChars >= MAX_SANDBOX_TOTAL_LOG_CHARS) {
+      if (!truncatedNoticeSent) {
+        truncatedNoticeSent = true;
+        const notice = '[warn] Console output limit reached; further logs suppressed.';
+        logs.push(notice);
+        onLog?.(notice);
+      }
+      return;
+    }
+    const line =
+      rawLine.length > MAX_SANDBOX_LOG_LINE_CHARS
+        ? rawLine.slice(0, MAX_SANDBOX_LOG_LINE_CHARS) + '…(truncated)'
+        : rawLine;
+    totalChars += line.length;
+    logs.push(line);
+    onLog?.(line);
+  };
+
   return {
     log: (...args: unknown[]) => {
-      const line = args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ');
-      logs.push(line);
-      onLog?.(line);
+      pushLine(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
     },
     warn: (...args: unknown[]) => {
-      const line = '[warn] ' + args.map((a) => String(a)).join(' ');
-      logs.push(line);
-      onLog?.(line);
+      pushLine('[warn] ' + args.map((a) => String(a)).join(' '));
     },
     error: (...args: unknown[]) => {
-      const line = '[error] ' + args.map((a) => String(a)).join(' ');
-      logs.push(line);
-      onLog?.(line);
+      pushLine('[error] ' + args.map((a) => String(a)).join(' '));
     },
   };
 }
