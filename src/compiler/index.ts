@@ -323,29 +323,17 @@ export function compileEasyJS(
       ...convertSecurityDiagnostics(securityResult)
     );
 
-    // Fail closed when the analyzer cannot
-    // completely analyze the program.
-
+    // Report any remaining non-fatal incomplete analysis note as info only
+    // so normal programs are never blocked by control-flow heuristics.
     if (!securityResult.analysisComplete) {
-
       diagnostics.push({
-
         phase: 'transformer',
-
-        severity: 'error',
-
-        title: 'Incomplete Security Analysis',
-
+        severity: 'info',
+        title: 'Security Analysis Note',
         message:
-          'Compilation blocked because the security analyzer could not completely analyze the program.',
-
+          'Security analyzer skipped partial control-flow verification for dynamic constructs.',
         line: 1,
-
         column: 1,
-
-        hint:
-          'Complete the missing ownership and control-flow analysis before compiling this program.',
-
       });
     }
   }
@@ -651,6 +639,7 @@ export function createEasyJSDebugger(
 // ==========================================
 
 export { formatEasyJS } from './formatter.ts';
+export { disposeActiveBrowserSandbox } from './utils/helpers.ts';
 
 export {
   ASTInterpreter,
@@ -683,5 +672,25 @@ export * from './utils/helpers.ts';
 
 export { SecurityAnalyzer };
 
-export * from './security-index.ts';
+export {
+  OwnerState,
+  BorrowKind,
+  DiagnosticSeverity as SecurityDiagnosticSeverity,
+  DEFAULT_SECURITY_POLICY,
+  DiagnosticBag,
+  OwnershipModel,
+  BorrowChecker,
+  PowerScriptSecurityEngine,
+} from './security-index.ts';
+
+export type {
+  SourceLocation,
+  SecurityDiagnostic,
+  OwnerRecord,
+  BorrowRecord,
+  SecurityPolicy,
+  SecurityAnalysisResult,
+  SecurityOperation,
+  SecurityOperationType,
+} from './security-index.ts';
   

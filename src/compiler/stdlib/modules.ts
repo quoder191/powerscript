@@ -5,7 +5,7 @@ export const MODULES_STDLIB_SOURCE = `
   const loadDbTable = (table) => {
     const key = String(table);
     if (memoryDb.has(key)) return memoryDb.get(key);
-    if (typeof localStorage !== "undefined") {
+    if (!(ioHandler && ioHandler.sandboxed) && typeof localStorage !== "undefined") {
       try {
         const raw = localStorage.getItem(DB_PREFIX + key);
         if (raw) {
@@ -27,7 +27,7 @@ export const MODULES_STDLIB_SOURCE = `
   const persistDbTable = (table, rows) => {
     const key = String(table);
     memoryDb.set(key, rows);
-    if (typeof localStorage !== "undefined") {
+    if (!(ioHandler && ioHandler.sandboxed) && typeof localStorage !== "undefined") {
       try {
         localStorage.setItem(DB_PREFIX + key, JSON.stringify(rows));
       } catch {

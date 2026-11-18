@@ -203,7 +203,19 @@ export class PowerScriptSecurityEngine {
     // End a scope
     exitScope(scopeId: string): void {
 
-        this.ownership.exitScope(scopeId);
+        this.ownership.exitScope(scopeId, {
+            requireExplicitBorrowEnd: this.policy.requireExplicitBorrowEnd,
+            warnOnOwnerNotConsumedAtScopeExit: this.policy.warnOnOwnerNotConsumedAtScopeExit,
+        });
+    }
+
+    // Snapshot / restore ownership state for branch & function analysis
+    snapshot() {
+        return this.ownership.snapshot();
+    }
+
+    restore(state: ReturnType<OwnershipModel["snapshot"]>): void {
+        this.ownership.restore(state);
     }
 
     // Get analysis result
@@ -228,5 +240,5 @@ export class PowerScriptSecurityEngine {
         this.diagnostics.clear();
         this.ownership.clear();
     }
-  }
+}
       

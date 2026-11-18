@@ -3,6 +3,7 @@ import { CheckCircle2, AlertCircle, Save, X } from 'lucide-react';
 import {
   ASTInterpreter,
   compileEasyJS,
+  disposeActiveBrowserSandbox,
   formatEasyJS,
   runEasyJSAsync,
   runEasyJSInterpreted,
@@ -567,6 +568,7 @@ export default function App() {
   } | null>(null);
   const activePopupDismissRef = useRef<(() => void) | null>(null);
   const activeDebuggerRef = useRef<ASTInterpreter | null>(null);
+  const activeRunAbortRef = useRef<AbortController | null>(null);
   const guiDispatcherRef = useRef<GuiEventDispatcher | null>(null);
   const runSeqRef = useRef(0);
   const termSeqRef = useRef(2);
@@ -610,9 +612,21 @@ export default function App() {
   // Live compile on edit for diagnostics and preview status
   const liveCompile = useMemo(() => compileEasyJS(source), [source]);
 
+  useEffect(() => {
+    return () => {
+      activeRunAbortRef.current?.abort();
+      disposeActiveBrowserSandbox();
+    };
+  }, []);
+
   const cancelActiveRun = () => {
     runSeqRef.current += 1;
     guiDispatcherRef.current = null;
+    if (activeRunAbortRef.current) {
+      activeRunAbortRef.current.abort();
+      activeRunAbortRef.current = null;
+    }
+    disposeActiveBrowserSandbox();
     if (activeDebuggerRef.current) {
       activeDebuggerRef.current.stop();
       activeDebuggerRef.current = null;
@@ -631,7 +645,8 @@ export default function App() {
     setIsRunning(false);
   };
 
-  const buildIoOptions = (seq: number): ExecuteAsyncOptions => ({
+  const buildIoOptions = (seq: number, signal?: AbortSignal): ExecuteAsyncOptions => ({
+    signal,
     onLog: (line) => {
       if (runSeqRef.current !== seq) return;
       setLiveLogs((prev) => [...prev, line]);
@@ -755,17 +770,22 @@ export default function App() {
   ) => {
     cancelActiveRun();
     const seq = ++runSeqRef.current;
+    const controller = new AbortController();
+    activeRunAbortRef.current = controller;
     setLiveLogs([]);
     setLiveVisuals([]);
     setIsRunning(true);
 
-    const ioOpts = buildIoOptions(seq);
+    const ioOpts = buildIoOptions(seq, controller.signal);
     const result =
       selectedEngine === 'interpreter'
         ? await runEasyJSInterpreted(codeToRun, ioOpts)
         : await runEasyJSAsync(codeToRun, ioOpts);
 
     if (runSeqRef.current === seq) {
+      if (activeRunAbortRef.current === controller) {
+        activeRunAbortRef.current = null;
+      }
       setRunResult(result);
       setIsRunning(false);
       setPendingPrompt(null);

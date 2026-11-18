@@ -1003,6 +1003,9 @@ export class ASTInterpreter {
           return finalVal;
         }
         if (expr.target.kind === 'MemberExpression') {
+          if (this.isBlockedProperty(expr.target.property)) {
+            throw new Error(`SecurityError: Access to '${expr.target.property}' is blocked in sandbox`);
+          }
           const obj = (await this.evalExpr(expr.target.object, env)) as Record<string, unknown>;
           const targetObj = obj && (obj as unknown as EjsInstance).__isEjsInstance
             ? (obj as unknown as EjsInstance).fields
@@ -1042,6 +1045,9 @@ export class ASTInterpreter {
             }
           }
           const key = String(idx);
+          if (this.isBlockedProperty(key)) {
+            throw new Error(`SecurityError: Access to '${key}' is blocked in sandbox`);
+          }
           const finalVal = expr.operator === '='
             ? rhs
             : this.applyCompoundOp(expr.operator, obj[key], rhs);
@@ -1125,7 +1131,11 @@ export class ASTInterpreter {
           if (numIdx === 0) return cur;
           return undefined;
         }
-        return obj[String(idx)];
+        const key = String(idx);
+        if (this.isBlockedProperty(key)) {
+          throw new Error(`SecurityError: Access to '${key}' is blocked in sandbox`);
+        }
+        return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
       }
 
       case 'NewExpression': {
@@ -1414,7 +1424,22 @@ export class ASTInterpreter {
     return false;
   }
 
+  private isBlockedProperty(prop: string): boolean {
+    return (
+      prop === '__proto__' ||
+      prop === 'constructor' ||
+      prop === 'prototype' ||
+      prop === '__defineGetter__' ||
+      prop === '__defineSetter__' ||
+      prop === '__lookupGetter__' ||
+      prop === '__lookupSetter__'
+    );
+  }
+
   private readMember(obj: unknown, prop: string): unknown {
+    if (this.isBlockedProperty(prop)) {
+      throw new Error(`SecurityError: Access to '${prop}' is blocked in sandbox`);
+    }
     if (obj === null || obj === undefined) throw new Error(`NullPointerError: Cannot read '.${prop}' of null`);
     if (typeof obj === 'object') {
       const o = obj as Record<string, unknown>;
@@ -1436,19 +1461,24 @@ export class ASTInterpreter {
         return undefined;
       }
       if (o.__isEjsClass) {
-        return (obj as EjsClassDef).staticProps[prop];
+        return Object.prototype.hasOwnProperty.call((obj as EjsClassDef).staticProps, prop)
+          ? (obj as EjsClassDef).staticProps[prop]
+          : undefined;
       }
-      return o[prop];
+      return Object.prototype.hasOwnProperty.call(o, prop) ? o[prop] : undefined;
     }
-    return (obj as Record<string, unknown>)[prop];
+    return undefined;
   }
 
   private async callObjectMethod(obj: unknown, method: string, args: unknown[], line: number): Promise<unknown> {
+    if (this.isBlockedProperty(method)) {
+      throw new Error(`SecurityError: Method '${method}()' is blocked in sandbox`);
+    }
     if (obj === null || obj === undefined) throw new Error(`NullPointerError: Cannot call '.${method}()' on null`);
 
     if (typeof obj === 'object' && (obj as Record<string, unknown>).__ptrKind) {
       const o = obj as Record<string, unknown>;
-      if (typeof o[method] === 'function') {
+      if (Object.prototype.hasOwnProperty.call(o, method) && typeof o[method] === 'function') {
         return await (o[method] as (...xs: unknown[]) => unknown).apply(obj, args);
       }
       return this.callObjectMethod(this.derefPointer(o), method, args, line);
@@ -1463,10 +1493,10 @@ export class ASTInterpreter {
 
     if (typeof obj === 'object' && !Array.isArray(obj) && !(obj instanceof Set)) {
       const o = obj as Record<string, unknown>;
-      if (typeof o[method] === 'function') {
+      if (Object.prototype.hasOwnProperty.call(o, method) && typeof o[method] === 'function') {
         return await (o[method] as (...xs: unknown[]) => unknown).apply(obj, args);
       }
-      if (o[method] && (o[method] as EjsCallable).__isEjsFn) {
+      if (Object.prototype.hasOwnProperty.call(o, method) && o[method] && (o[method] as EjsCallable).__isEjsFn) {
         return this.invokeCallableValue(o[method], args, line);
       }
     }
@@ -1766,6 +1796,9 @@ export class ASTInterpreter {
       };
     }
     if (target.kind === 'MemberExpression') {
+      if (this.isBlockedProperty(target.property)) {
+        throw new Error(`SecurityError: Access to '${target.property}' is blocked in sandbox`);
+      }
       const obj = (await this.evalExpr(target.object, env)) as Record<string, unknown>;
       const prop = target.property;
       return {
@@ -1783,9 +1816,12 @@ export class ASTInterpreter {
       const obj = (await this.evalExpr(target.object, env)) as Record<string, unknown>;
       const idx = await this.evalExpr(target.index, env);
       const key = String(idx);
+      if (this.isBlockedProperty(key)) {
+        throw new Error(`SecurityError: Access to '${key}' is blocked in sandbox`);
+      }
       return {
         label: `[${key}]`,
-        getter: () => obj[key],
+        getter: () => (Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined),
         setter: (v) => {
           obj[key] = v;
         },
@@ -1812,7 +1848,7 @@ export class ASTInterpreter {
     const lval = await this.resolveLValueRef(targetExpr, env);
     const addr = this.nextHexAddr();
     this.pointerEvents.push({ op: 'addr', name, state: 'active', detail: addr });
-    return {
+    const ptrObj = {
       __ptrKind: 'ptr',
       name,
       addr,
@@ -1836,6 +1872,7 @@ export class ASTInterpreter {
         return `<ptr ${this.name} @ ${this.addr}: ${formatVal(this.get())}>`;
       },
     };
+    return ptrObj;
   }
 
   private allocSingle(val: unknown = null, typeName = 'T'): Record<string, unknown> {
@@ -1981,29 +2018,36 @@ export class ASTInterpreter {
   }
 
   private makeWeak(sharedPtr: unknown, name = 'weak_ptr'): Record<string, unknown> {
-    const target = (sharedPtr && typeof sharedPtr === 'object' ? sharedPtr : null) as Record<string, unknown> | null;
+    interface WeakTarget {
+      name?: unknown;
+      alive?: unknown;
+      refCount?: unknown;
+      clone?: () => unknown;
+    }
+    const target = (sharedPtr && typeof sharedPtr === 'object' ? sharedPtr : null) as WeakTarget | null;
     this.pointerEvents.push({ op: 'weak_ptr', name, state: 'active', detail: target ? `-> ${target.name}` : 'empty' });
-    return {
+    const weakObj = {
       __ptrKind: 'weak',
       name,
       target,
       alive: true,
       moved: false,
-      expired() {
+      expired(): boolean {
         return !this.alive || !this.target || !this.target.alive || Number(this.target.refCount) <= 0;
       },
-      use_count() {
+      use_count(): number {
         return this.expired() ? 0 : Number(this.target!.refCount);
       },
-      lock() {
+      lock(): unknown {
         if (this.expired()) return null;
-        return typeof this.target!.clone === 'function' ? (this.target!.clone as () => unknown)() : sharedPtr;
+        return typeof this.target!.clone === 'function' ? this.target!.clone() : sharedPtr;
       },
-      reset() {
+      reset(): void {
         this.alive = false;
         this.target = null;
       },
     };
+    return weakObj;
   }
 
   private makeOwn(value: unknown, name = 'own') {
@@ -2349,7 +2393,17 @@ export class ASTInterpreter {
     });
     def('listen', async (p = 'Listening: ') => readInputRaw(String(p)));
     def('fetch', async (url: unknown, opts?: RequestInit) => {
-      const res = await globalThis.fetch(String(url), opts);
+      const raw = String(url ?? '');
+      let parsed: URL;
+      try {
+        parsed = new URL(raw, 'https://sandbox.invalid');
+      } catch {
+        throw new Error(`SecurityError: Invalid fetch URL '${raw}'`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`SecurityError: Blocked fetch protocol '${parsed.protocol}' in sandbox`);
+      }
+      const res = await globalThis.fetch(parsed.toString(), opts);
       const ct = res.headers?.get?.('content-type') || '';
       return ct.includes('application/json') ? res.json() : res.text();
     });
@@ -2474,10 +2528,6 @@ export class ASTInterpreter {
     def('exit', () => { this.cleanupTimers(); throw new ExitSignal('Exited by exit()'); });
     def('readFile', (p: unknown) => {
       const k = String(p);
-      if (typeof localStorage !== 'undefined') {
-        const s = localStorage.getItem('easyjs_vfs:' + k);
-        if (s !== null) return s;
-      }
       if (this.memoryVfs.has(k)) return this.memoryVfs.get(k);
       throw new Error(`FileNotFoundError: '${k}' does not exist`);
     });
@@ -2485,19 +2535,11 @@ export class ASTInterpreter {
       const k = String(p);
       const data = formatVal(c);
       this.memoryVfs.set(k, data);
-      if (typeof localStorage !== 'undefined') {
-        try { localStorage.setItem('easyjs_vfs:' + k, data); } catch { /* ignore */ }
-      }
       return true;
     });
     def('deleteFile', (p: unknown) => {
       const k = String(p);
-      let removed = this.memoryVfs.delete(k);
-      if (typeof localStorage !== 'undefined' && localStorage.getItem('easyjs_vfs:' + k) !== null) {
-        localStorage.removeItem('easyjs_vfs:' + k);
-        removed = true;
-      }
-      return removed;
+      return this.memoryVfs.delete(k);
     });
     def('download', (name: unknown, content: unknown = '') => {
       this.emitLog(`[download] ${String(name)} (${formatVal(content).length} bytes)`);
@@ -2537,27 +2579,15 @@ export class ASTInterpreter {
       set: (init: unknown[] = []) => new Set(init),
     });
 
-    // Built-in DB, HTTP Server, Visual UI, Package Manager
+    // Built-in DB (isolated sandbox memory), HTTP Server, Visual UI, Package Manager
     const loadTable = (t: string) => {
       if (this.memoryDb.has(t)) return this.memoryDb.get(t)!;
-      if (typeof localStorage !== 'undefined') {
-        try {
-          const raw = localStorage.getItem('easyjs_db:' + t);
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) { this.memoryDb.set(t, parsed); return parsed; }
-          }
-        } catch { /* ignore */ }
-      }
       const empty: Array<Record<string, unknown>> = [];
       this.memoryDb.set(t, empty);
       return empty;
     };
     const saveTable = (t: string, rows: Array<Record<string, unknown>>) => {
       this.memoryDb.set(t, rows);
-      if (typeof localStorage !== 'undefined') {
-        try { localStorage.setItem('easyjs_db:' + t, JSON.stringify(rows)); } catch { /* ignore */ }
-      }
     };
     def('db', {
       save: (table: string, rec: Record<string, unknown>) => {

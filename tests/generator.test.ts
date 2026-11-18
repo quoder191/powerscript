@@ -549,6 +549,61 @@ print(x, y, **pp, s, sizeof(int), u2->val, *locked, wk.expired())
         assertTrue(!constErr.success, 'Expected compile error writing through const int*');
       },
     },
+    {
+      name: 'SecurityAnalyzer analyzes imports, style blocks, classes, loops, and branches without false errors',
+      fn: () => {
+        const src = `
+import yourgui from "stdlib/yourgui"
+style { body { color: #f8fafc; } }
+class Item {
+  pub count: int
+  init(count: int) { self.count = count }
+  pub fn inc() -> int { return self.count + 1 }
+}
+fn runAll(limit: int):
+  for (i = 0, i < limit, i++):
+    if i == 1:
+      print("one")
+    else:
+      print(i)
+obj = new Item(2)
+print(obj.inc())
+runAll(2)
+`;
+        const out = runEasyJS(src);
+        assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
+        assertTrue(out.security?.analysisComplete === true, 'Expected complete security analysis');
+        assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
+        assertTrue(
+          out.execution?.logs.join('|') === '3|0|one',
+          `Expected '3|0|one', got ${out.execution?.logs.join('|')}`
+        );
+      },
+    },
+    {
+      name: 'SecurityAnalyzer catches ownership violations and sandbox isolates host globals and eval',
+      fn: () => {
+        const dropBorrowed = compileEasyJS(`own a = 1\nref r = &a\ndrop a`);
+        assertTrue(!dropBorrowed.success, 'Expected drop-while-borrowed to fail compilation');
+
+        const useMoved = compileEasyJS(`own a = 1\nown b = move a\nprint(*a)`);
+        assertTrue(!useMoved.success, 'Expected use-after-move to fail compilation');
+
+        const sbGlobals = runEasyJS(`print(window == undefined, document == undefined, process == undefined, require == undefined)`);
+        assertTrue(sbGlobals.success && !sbGlobals.execution?.error, 'Expected sandbox global check to run');
+        assertTrue(
+          sbGlobals.execution?.logs[0] === 'true true true true',
+          `Expected host globals to be blocked, got ${sbGlobals.execution?.logs[0]}`
+        );
+
+        const sbEval = runEasyJS(`try {\n  eval("1 + 1")\n} catch e {\n  print(e.message)\n}`);
+        assertTrue(sbEval.success && !sbEval.execution?.error, 'Expected sandbox eval catch to run');
+        assertTrue(
+          Boolean(sbEval.execution?.logs[0]?.includes('SecurityError')),
+          `Expected SecurityError from eval(), got ${sbEval.execution?.logs[0]}`
+        );
+      },
+    },
   ];
 
   return tests.map((t) => {

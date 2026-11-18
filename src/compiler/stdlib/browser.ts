@@ -126,7 +126,17 @@ export const BROWSER_STDLIB_SOURCE = `
   };
 
   const fetchData = async (url, options = undefined) => {
-    const res = await globalThis.fetch(String(url), options);
+    const raw = String(url ?? "");
+    let parsed;
+    try {
+      parsed = new URL(raw, "https://sandbox.invalid");
+    } catch {
+      throw new Error("SecurityError: Invalid URL '" + raw + "'");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("SecurityError: Blocked fetch protocol '" + parsed.protocol + "' in sandbox");
+    }
+    const res = await globalThis.fetch(parsed.toString(), options);
     const contentType = res.headers?.get?.("content-type") || "";
     if (contentType.includes("application/json")) {
       return await res.json();

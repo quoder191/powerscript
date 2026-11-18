@@ -19,10 +19,11 @@ export const SYSTEM_STDLIB_SOURCE = `
 
   const VFS_PREFIX = "easyjs_vfs:";
   const memoryVfs = new Map();
+  const isSandboxed = Boolean(ioHandler && ioHandler.sandboxed);
 
   const readFileVfs = (path) => {
     const key = String(path);
-    if (typeof localStorage !== "undefined") {
+    if (!isSandboxed && typeof localStorage !== "undefined") {
       const stored = localStorage.getItem(VFS_PREFIX + key);
       if (stored !== null) return stored;
     }
@@ -34,7 +35,7 @@ export const SYSTEM_STDLIB_SOURCE = `
     const key = String(path);
     const data = formatVal(content);
     memoryVfs.set(key, data);
-    if (typeof localStorage !== "undefined") {
+    if (!isSandboxed && typeof localStorage !== "undefined") {
       try {
         localStorage.setItem(VFS_PREFIX + key, data);
       } catch {
@@ -47,7 +48,7 @@ export const SYSTEM_STDLIB_SOURCE = `
   const deleteFileVfs = (path) => {
     const key = String(path);
     let removed = memoryVfs.delete(key);
-    if (typeof localStorage !== "undefined") {
+    if (!isSandboxed && typeof localStorage !== "undefined") {
       const exists = localStorage.getItem(VFS_PREFIX + key) !== null;
       if (exists) {
         localStorage.removeItem(VFS_PREFIX + key);

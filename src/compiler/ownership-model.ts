@@ -311,22 +311,17 @@ export class OwnershipModel {
     // 9. Check scope exit
     // ======================================
 
-    exitScope(scopeId: string): void {
-
-        for (const owner of this.owners.values()) {
-
-            if (
-                owner.scopeId === scopeId &&
-                owner.state === OwnerState.ACTIVE
-            ) {
-                this.diagnostics.warning(
-                    "OWN014",
-                    `Owner '${owner.name}' remains active at scope exit.`,
-                    owner.createdAt,
-                    "Consider explicitly dropping or transferring ownership."
-                );
-            }
+    exitScope(
+        scopeId: string,
+        options?: {
+            requireExplicitBorrowEnd?: boolean;
+            warnOnOwnerNotConsumedAtScopeExit?: boolean;
         }
+    ): void {
+        const requireExplicitBorrowEnd =
+            options?.requireExplicitBorrowEnd ?? false;
+        const warnOnOwnerNotConsumed =
+            options?.warnOnOwnerNotConsumedAtScopeExit ?? false;
 
         for (const borrow of this.borrows.values()) {
 
@@ -334,11 +329,36 @@ export class OwnershipModel {
                 borrow.scopeId === scopeId &&
                 borrow.active
             ) {
-                this.diagnostics.error(
-                    "OWN015",
-                    `Borrow '${borrow.id}' remains active at scope exit.`,
-                    borrow.createdAt
-                );
+                if (requireExplicitBorrowEnd) {
+                    this.diagnostics.error(
+                        "OWN015",
+                        `Borrow '${borrow.id}' remains active at scope exit.`,
+                        borrow.createdAt
+                    );
+                } else {
+                    // Lexical RAII: end borrows belonging to the exiting scope
+                    borrow.active = false;
+                }
+            }
+        }
+
+        for (const owner of this.owners.values()) {
+
+            if (
+                owner.scopeId === scopeId &&
+                owner.state === OwnerState.ACTIVE
+            ) {
+                if (warnOnOwnerNotConsumed) {
+                    this.diagnostics.warning(
+                        "OWN014",
+                        `Owner '${owner.name}' remains active at scope exit.`,
+                        owner.createdAt,
+                        "Consider explicitly dropping or transferring ownership."
+                    );
+                } else {
+                    // Lexical RAII: release owner at scope exit
+                    owner.state = OwnerState.DROPPED;
+                }
             }
         }
     }
@@ -360,11 +380,44 @@ export class OwnershipModel {
     }
 
     // ======================================
-    // 12. Reset ownership state
+    // 12. Snapshot & restore ownership state
+    // ======================================
+
+    snapshot(): {
+        owners: Map<string, OwnerRecord>;
+        borrows: Map<string, BorrowRecord>;
+    } {
+        const owners = new Map<string, OwnerRecord>();
+        for (const [k, v] of this.owners.entries()) {
+            owners.set(k, { ...v });
+        }
+        const borrows = new Map<string, BorrowRecord>();
+        for (const [k, v] of this.borrows.entries()) {
+            borrows.set(k, { ...v });
+        }
+        return { owners, borrows };
+    }
+
+    restore(state: {
+        owners: Map<string, OwnerRecord>;
+        borrows: Map<string, BorrowRecord>;
+    }): void {
+        this.owners.clear();
+        for (const [k, v] of state.owners.entries()) {
+            this.owners.set(k, { ...v });
+        }
+        this.borrows.clear();
+        for (const [k, v] of state.borrows.entries()) {
+            this.borrows.set(k, { ...v });
+        }
+    }
+
+    // ======================================
+    // 13. Reset ownership state
     // ======================================
 
     clear(): void {
         this.owners.clear();
         this.borrows.clear();
     }
-              }
+}
