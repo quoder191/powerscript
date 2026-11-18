@@ -6,9 +6,18 @@ import type {
   RegisteredRouteInfo,
   VisualOutputItem,
 } from './utils/helpers.ts';
+import {
+  NetworkPolicyManager,
+  SecurityPolicyManager,
+  type CompilerSecurityPolicy,
+  type PartialCompilerSecurityPolicy,
+} from './security-policy.ts';
+import { buildBrowserSandboxDocument } from './builder-engine.ts';
 
 export interface SandboxIoOptions extends ExecuteAsyncOptions {
   signal?: AbortSignal;
+  securityPolicy?: PartialCompilerSecurityPolicy;
+  ephemeral?: boolean;
 }
 
 interface NodeVmModule {
@@ -56,47 +65,21 @@ function isExitSignalError(err: unknown): boolean {
   );
 }
 
-function createMemoryStorageShim(): Storage {
-  const store = new Map<string, string>();
-  return {
-    get length() {
-      return store.size;
-    },
-    clear() {
-      store.clear();
-    },
-    getItem(key: string) {
-      return store.has(String(key)) ? store.get(String(key))! : null;
-    },
-    key(index: number) {
-      return Array.from(store.keys())[index] ?? null;
-    },
-    removeItem(key: string) {
-      store.delete(String(key));
-    },
-    setItem(key: string, value: string) {
-      store.set(String(key), String(value));
-    },
-  };
-}
-
-function createGuardedFetch(): typeof fetch {
+function createPolicyBoundedFetch(networkPolicy: CompilerSecurityPolicy['network']): typeof fetch {
   const hostFetch = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null;
+  const manager = new NetworkPolicyManager(networkPolicy);
+
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl, 'https://sandbox.invalid');
-    } catch {
-      throw new Error(`SecurityError: Invalid fetch URL '${rawUrl}'`);
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error(`SecurityError: Blocked fetch protocol '${parsed.protocol}' in sandbox`);
-    }
     if (!hostFetch) {
+      // Still run policy validation first so cookie/protocol/SSRF checks report consistently
+      const check = manager.validateFetchCall(rawUrl, init, true);
+      if (!check.ok) {
+        throw new Error(check.reason);
+      }
       throw new Error('SandboxError: Network fetch is unavailable in this environment');
     }
-    return hostFetch(parsed.toString(), init);
+    return manager.executeBoundedFetch(hostFetch, rawUrl, init);
   }) as typeof fetch;
 }
 
@@ -123,134 +106,38 @@ function createCapturedConsole(
   };
 }
 
-function buildSafeSandboxScope(
-  capturedConsole: Record<string, (...args: unknown[]) => void>,
-  stdin: unknown[],
-  ioHandler: Record<string, unknown>
-): Record<string, unknown> {
-  const memoryStorage = createMemoryStorageShim();
-  const safeLocation = Object.freeze({
-    href: 'https://sandbox.easyjs.local/',
-    pathname: '/',
-    hostname: 'sandbox.easyjs.local',
-    origin: 'https://sandbox.easyjs.local',
-    protocol: 'https:',
-    search: '',
-    hash: '',
-  });
-
-  const scope: Record<string, unknown> = {
-    // Safe JS Standard Built-ins
-    Object,
-    Array,
-    String,
-    Number,
-    Boolean,
-    Math,
-    Date,
-    JSON,
-    RegExp,
-    Map,
-    Set,
-    WeakMap,
-    WeakSet,
-    Promise,
-    Error,
-    TypeError,
-    RangeError,
-    SyntaxError,
-    ReferenceError,
-    URIError,
-    EvalError,
-    Symbol,
-    BigInt,
-    Int8Array,
-    Uint8Array,
-    Uint8ClampedArray,
-    Int16Array,
-    Uint16Array,
-    Int32Array,
-    Uint32Array,
-    Float32Array,
-    Float64Array,
-    ArrayBuffer,
-    DataView,
-    Proxy,
-    Reflect,
-    Infinity,
-    NaN,
-    undefined,
-    parseInt,
-    parseFloat,
-    isNaN,
-    isFinite,
-    encodeURIComponent,
-    decodeURIComponent,
-    encodeURI,
-    decodeURI,
-    atob: typeof atob === 'function' ? atob : (s: string) => Buffer.from(s, 'base64').toString('binary'),
-    btoa: typeof btoa === 'function' ? btoa : (s: string) => Buffer.from(s, 'binary').toString('base64'),
-    setTimeout,
-    clearTimeout,
-    setInterval,
-    clearInterval,
-    queueMicrotask,
-    URL,
-    URLSearchParams,
-    TextEncoder,
-    TextDecoder,
-    crypto: typeof crypto !== 'undefined' ? crypto : undefined,
-
-    // Controlled sandbox I/O & isolated storage
-    console: capturedConsole,
-    __ejs_stdin: [...stdin],
-    __ejs_io: ioHandler,
-    localStorage: memoryStorage,
-    sessionStorage: createMemoryStorageShim(),
-    location: safeLocation,
-    fetch: createGuardedFetch(),
-
-    // Explicitly shadowed / blocked host globals
-    window: undefined,
-    document: undefined,
-    self: undefined,
-    top: undefined,
-    parent: undefined,
-    frames: undefined,
-    opener: undefined,
-    navigator: undefined,
-    history: undefined,
-    indexedDB: undefined,
-    cookieStore: undefined,
-    XMLHttpRequest: undefined,
-    WebSocket: undefined,
-    Worker: undefined,
-    SharedWorker: undefined,
-    ServiceWorker: undefined,
-    importScripts: undefined,
-    process: undefined,
-    require: undefined,
-    module: undefined,
-    exports: undefined,
-    global: undefined,
-    Buffer: undefined,
-    Deno: undefined,
-    Bun: undefined,
-    eval: () => {
-      throw new Error('SecurityError: eval() is disabled inside the EasyJS sandbox');
-    },
-    Function: function BlockedFunction() {
-      throw new Error('SecurityError: Dynamic Function() construction is disabled inside the EasyJS sandbox');
-    },
-  };
-
-  scope.globalThis = scope;
-  return scope;
+function buildGlobalThisShadowLine(mode: CompilerSecurityPolicy['globals']['globalThisMode']): string {
+  if (mode === 'disabled') {
+    return `const globalThis = typeof __ejs_disabled_globalThis !== "undefined" ? __ejs_disabled_globalThis : undefined;`;
+  }
+  if (mode === 'readonly') {
+    return `const globalThis = Object.freeze({ Math, JSON, Date, Array, Object, String, Number, Boolean, console, location, fetch: typeof __ejs_fetch === "function" ? __ejs_fetch : undefined });`;
+  }
+  return '';
 }
 
-function wrapCompiledCodeSync(code: string): string {
+export function buildSandboxHardeningLine(freezeRealmPrototypes: boolean): string {
+  if (!freezeRealmPrototypes) return '';
+  return `
+    try {
+      Object.preventExtensions(Object.prototype);
+      Object.preventExtensions(Array.prototype);
+      Object.preventExtensions(Function.prototype);
+      Object.preventExtensions(String.prototype);
+      Object.preventExtensions(Number.prototype);
+    } catch {}
+  `;
+}
+
+export function wrapCompiledCodeSync(
+  code: string,
+  globalThisMode: CompilerSecurityPolicy['globals']['globalThisMode'],
+  freezeRealmPrototypes = false
+): string {
   return `
     "use strict";
+    ${buildSandboxHardeningLine(freezeRealmPrototypes)}
+    ${buildGlobalThisShadowLine(globalThisMode)}
     ${code}
     if (typeof __ejs !== "undefined" && __ejs.yourgui && typeof __ejs.yourgui.flush === "function") {
       __ejs.yourgui.flush();
@@ -263,9 +150,15 @@ function wrapCompiledCodeSync(code: string): string {
   `;
 }
 
-function wrapCompiledCodeAsync(code: string): string {
+export function wrapCompiledCodeAsync(
+  code: string,
+  globalThisMode: CompilerSecurityPolicy['globals']['globalThisMode'],
+  freezeRealmPrototypes = false
+): string {
   return `
     "use strict";
+    ${buildSandboxHardeningLine(freezeRealmPrototypes)}
+    ${buildGlobalThisShadowLine(globalThisMode)}
     return (async () => {
       ${code}
       if (typeof __ejs !== "undefined" && __ejs.yourgui && typeof __ejs.yourgui.flush === "function") {
@@ -280,38 +173,184 @@ function wrapCompiledCodeAsync(code: string): string {
   `;
 }
 
-function runWithProxyRealm<T>(
-  wrappedBody: string,
-  sandboxScope: Record<string, unknown>
-): T {
-  const blockedProp = (prop: PropertyKey) =>
-    prop === '__proto__' || prop === 'constructor' || prop === 'prototype';
 
-  const scopeProxy = new Proxy(sandboxScope, {
-    has() {
-      // Intercept ALL free variable lookups so nothing leaks to host window/globalThis
-      return true;
-    },
-    get(target, prop) {
-      if (prop === Symbol.unscopables) return undefined;
-      if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(target, prop)) {
-        return target[prop];
-      }
-      return undefined;
-    },
-    set(target, prop, value) {
-      if (blockedProp(prop)) return false;
-      target[String(prop)] = value;
-      return true;
-    },
+
+function createHardenedVmContext(
+  vm: NodeVmModule,
+  name: string,
+  capturedConsole: Record<string, (...args: unknown[]) => void>,
+  stdin: unknown[],
+  ioHandler: Record<string, unknown>,
+  policy: CompilerSecurityPolicy
+): Record<string, unknown> {
+  const boundedFetch = createPolicyBoundedFetch(policy.network);
+  const context = vm.createContext(Object.create(null), {
+    name,
+    codeGeneration: { strings: false, wasm: false },
   });
 
-  // Note: `with` lives outside `"use strict"` IIFE so strict mode rules still apply to EasyJS code.
-  const executor = new Function(
-    '__sandboxScope',
-    `with (__sandboxScope) { return (function() { ${wrappedBody} }).call(undefined); }`
-  );
-  return executor(scopeProxy) as T;
+  Object.defineProperty(context, '__ejs_host_bridge', {
+    value: {
+      log: capturedConsole.log,
+      warn: capturedConsole.warn,
+      error: capturedConsole.error,
+      fetch: boundedFetch,
+      stdin: [...stdin],
+      io: ioHandler,
+      globalThisMode: policy.globals.globalThisMode,
+      URL,
+      URLSearchParams,
+      TextEncoder,
+      TextDecoder,
+      atob: typeof atob === 'function' ? atob : (s: string) => Buffer.from(s, 'base64').toString('binary'),
+      btoa: typeof btoa === 'function' ? btoa : (s: string) => Buffer.from(s, 'binary').toString('base64'),
+      setTimeout: (fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => setTimeout(fn, ms, ...args),
+      clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
+      setInterval: (fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => setInterval(fn, ms, ...args),
+      clearInterval: (id: ReturnType<typeof setInterval>) => clearInterval(id),
+      queueMicrotask: (fn: () => void) => queueMicrotask(fn),
+    },
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
+
+  const bootstrap = `
+    (() => {
+      "use strict";
+      const B = globalThis.__ejs_host_bridge;
+      delete globalThis.__ejs_host_bridge;
+      const __vmProxy = Proxy;
+      const __blockedFn = function BlockedFunction() {
+        throw new Error('SecurityError: Dynamic Function() construction is disabled inside the EasyJS sandbox');
+      };
+      const __blockedEval = function blockedEval() {
+        throw new Error('SecurityError: eval() is disabled inside the EasyJS sandbox');
+      };
+      const makeStorage = () => {
+        const m = new Map();
+        return {
+          get length() { return m.size; },
+          clear() { m.clear(); },
+          getItem(k) { return m.has(String(k)) ? m.get(String(k)) : null; },
+          key(i) { return Array.from(m.keys())[i] ?? null; },
+          removeItem(k) { m.delete(String(k)); },
+          setItem(k, v) { m.set(String(k), String(v)); },
+        };
+      };
+      const vmConsole = {
+        log: (...a) => { B.log(...a); },
+        warn: (...a) => { B.warn(...a); },
+        error: (...a) => { B.error(...a); },
+      };
+      const vmFetch = async (input, init) => {
+        const res = await B.fetch(input, init);
+        return {
+          ok: Boolean(res.ok),
+          status: Number(res.status),
+          statusText: String(res.statusText || ''),
+          url: String(res.url || ''),
+          redirected: Boolean(res.redirected),
+          headers: {
+            get: (k) => (res.headers && typeof res.headers.get === 'function' ? res.headers.get(String(k)) : null),
+            has: (k) => (res.headers && typeof res.headers.has === 'function' ? res.headers.has(String(k)) : false),
+          },
+          text: async () => String(await res.text()),
+          json: async () => JSON.parse(String(await res.text())),
+        };
+      };
+      const vmIo = {
+        sandboxed: true,
+        onInput: B.io && typeof B.io.onInput === 'function' ? (p) => B.io.onInput(p) : undefined,
+        onEcho: B.io && typeof B.io.onEcho === 'function' ? (p, v) => B.io.onEcho(p, v) : undefined,
+        onAlert: B.io && typeof B.io.onAlert === 'function' ? (m) => B.io.onAlert(m) : undefined,
+        onConfirm: B.io && typeof B.io.onConfirm === 'function' ? (m) => B.io.onConfirm(m) : undefined,
+        onPrompt: B.io && typeof B.io.onPrompt === 'function' ? (m, d) => B.io.onPrompt(m, d) : undefined,
+        onBrowser: B.io && typeof B.io.onBrowser === 'function' ? (u) => B.io.onBrowser(u) : undefined,
+        onVisual: B.io && typeof B.io.onVisual === 'function' ? (item) => B.io.onVisual(item) : undefined,
+        onServerStart: B.io && typeof B.io.onServerStart === 'function' ? (port, routes) => B.io.onServerStart(port, routes) : undefined,
+        registerGuiDispatcher: B.io && typeof B.io.registerGuiDispatcher === 'function' ? (fn) => B.io.registerGuiDispatcher(fn) : undefined,
+      };
+      const safeLocation = Object.freeze({
+        href: 'https://sandbox.easyjs.local/',
+        pathname: '/',
+        hostname: 'sandbox.easyjs.local',
+        origin: 'https://sandbox.easyjs.local',
+        protocol: 'https:',
+        search: '',
+        hash: '',
+      });
+      globalThis.console = vmConsole;
+      globalThis.localStorage = makeStorage();
+      globalThis.sessionStorage = makeStorage();
+      globalThis.location = safeLocation;
+      globalThis.fetch = vmFetch;
+      globalThis.__ejs_fetch = vmFetch;
+      globalThis.__ejs_Proxy = __vmProxy;
+      globalThis.__ejs_stdin = Array.isArray(B.stdin) ? [...B.stdin] : [];
+      globalThis.__ejs_io = vmIo;
+      globalThis.__ejs_disabled_globalThis = new __vmProxy(Object.freeze({}), {
+        get() { throw new Error("SecurityError: Access to 'globalThis' is disabled by security policy"); },
+        set() { throw new Error("SecurityError: Access to 'globalThis' is disabled by security policy"); },
+        has() { return false; },
+      });
+      globalThis.URL = function SafeURL(u, base) { return base !== undefined ? new B.URL(u, base) : new B.URL(u); };
+      globalThis.URLSearchParams = function SafeURLSearchParams(init) { return new B.URLSearchParams(init); };
+      globalThis.TextEncoder = function SafeTextEncoder() { return new B.TextEncoder(); };
+      globalThis.TextDecoder = function SafeTextDecoder(label) { return new B.TextDecoder(label); };
+      globalThis.atob = (s) => B.atob(String(s));
+      globalThis.btoa = (s) => B.btoa(String(s));
+      globalThis.setTimeout = (fn, ms, ...a) => {
+        if (typeof fn !== 'function') throw new Error('SecurityError: setTimeout() only accepts a function callback inside the sandbox');
+        return B.setTimeout(fn, ms, ...a);
+      };
+      globalThis.clearTimeout = (id) => B.clearTimeout(id);
+      globalThis.setInterval = (fn, ms, ...a) => {
+        if (typeof fn !== 'function') throw new Error('SecurityError: setInterval() only accepts a function callback inside the sandbox');
+        return B.setInterval(fn, ms, ...a);
+      };
+      globalThis.clearInterval = (id) => B.clearInterval(id);
+      globalThis.queueMicrotask = (fn) => B.queueMicrotask(fn);
+
+      const blockedNames = [
+        'Proxy', 'Reflect', 'WebAssembly', 'SharedArrayBuffer', 'Atomics', 'WeakRef',
+        'FinalizationRegistry', 'EventSource', 'BroadcastChannel', 'MessageChannel', 'MessagePort',
+        'window', 'document', 'self', 'top', 'parent', 'frames', 'opener', 'navigator',
+        'history', 'indexedDB', 'cookieStore', 'XMLHttpRequest', 'WebSocket', 'Worker',
+        'SharedWorker', 'ServiceWorker', 'importScripts', 'process', 'require', 'module',
+        'exports', 'global', 'Buffer', 'Deno', 'Bun', 'AsyncFunction', 'GeneratorFunction',
+        'AsyncGeneratorFunction', 'ActiveXObject', 'WScript'
+      ];
+      for (const n of blockedNames) {
+        try {
+          Object.defineProperty(globalThis, n, { value: undefined, writable: false, configurable: false });
+        } catch {
+          globalThis[n] = undefined;
+        }
+      }
+      const NativeFnProto = Object.getPrototypeOf(() => {});
+      const NativeAsyncFnProto = Object.getPrototypeOf(async () => {});
+      const NativeGenProto = Object.getPrototypeOf(function* () {});
+      const NativeAsyncGenProto = Object.getPrototypeOf(async function* () {});
+      try {
+        for (const p of [NativeFnProto, NativeAsyncFnProto, NativeGenProto, NativeAsyncGenProto]) {
+          try {
+            Object.defineProperty(p, 'constructor', { value: __blockedFn, writable: false, configurable: false });
+          } catch {}
+        }
+        Object.defineProperty(globalThis, 'eval', { value: __blockedEval, writable: false, configurable: false });
+        Object.defineProperty(globalThis, 'Function', { value: __blockedFn, writable: false, configurable: false });
+        Object.preventExtensions(Object.prototype);
+        Object.preventExtensions(Array.prototype);
+        Object.preventExtensions(NativeFnProto);
+        Object.preventExtensions(String.prototype);
+        Object.preventExtensions(Number.prototype);
+      } catch {}
+    })();
+  `;
+
+  vm.runInContext(bootstrap, context, { timeout: 1000, filename: 'easyjs-vm-bootstrap.js' });
+  return context;
 }
 
 export function runSyncInSandbox(
@@ -323,16 +362,20 @@ export function runSyncInSandbox(
   const capturedConsole = createCapturedConsole(logs);
   const ioHandler = { sandboxed: true };
   const stdin = options.stdin ?? [];
+  const policy = new SecurityPolicyManager(options.securityPolicy).policy;
 
   const vm = getNodeVm();
   if (vm) {
     try {
-      const vmScope = buildSafeSandboxScope(capturedConsole, stdin, ioHandler);
-      const context = vm.createContext(vmScope, {
-        name: 'EasyJSSyncSandbox',
-        codeGeneration: { strings: false, wasm: false },
-      });
-      const wrapped = `(() => {\n${wrapCompiledCodeSync(code)}\n})()`;
+      const context = createHardenedVmContext(
+        vm,
+        'EasyJSSyncSandbox',
+        capturedConsole,
+        stdin,
+        ioHandler,
+        policy
+      );
+      const wrapped = `(() => {\n${wrapCompiledCodeSync(code, policy.globals.globalThisMode, false)}\n})()`;
       const meta = (vm.runInContext(wrapped, context, {
         timeout: DEFAULT_SYNC_TIMEOUT_MS,
         filename: 'easyjs-sandbox.js',
@@ -363,253 +406,15 @@ export function runSyncInSandbox(
     }
   }
 
-  // Browser / Edge fallback: Strict Proxy-isolated realm
-  try {
-    const scope = buildSafeSandboxScope(capturedConsole, stdin, ioHandler);
-    const meta = (runWithProxyRealm<Record<string, unknown>>(
-      wrapCompiledCodeSync(code),
-      scope
-    ) ?? {}) as {
-      pointerEvents?: PointerRuntimeEvent[];
-      visualOutputs?: VisualOutputItem[];
-      registeredRoutes?: RegisteredRouteInfo[];
-    };
-    const durationMs = Number((performance.now() - start).toFixed(2));
-    return {
-      logs,
-      pointerEvents: meta.pointerEvents ?? [],
-      visualOutputs: meta.visualOutputs ?? [],
-      registeredRoutes: meta.registeredRoutes ?? [],
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = Number((performance.now() - start).toFixed(2));
-    if (isExitSignalError(err)) {
-      return { logs, pointerEvents: [], durationMs, haltedByExit: true };
-    }
-    return {
-      logs,
-      pointerEvents: [],
-      durationMs,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-function buildIframeSandboxSrcDoc(sandboxToken: string): string {
-  const tokenJson = JSON.stringify(sandboxToken);
-  return `<!doctype html>
-<html>
-<head><meta charset="utf-8" /></head>
-<body>
-<script>
-(() => {
-  const TOKEN = ${tokenJson};
-  let activePort = null;
-  let guiDispatcher = null;
-  let reqSeq = 0;
-  const pendingIo = new Map();
-
-  const sendIoRpc = (kind, payload) =>
-    new Promise((resolve, reject) => {
-      if (!activePort) {
-        reject(new Error('Sandbox channel closed'));
-        return;
-      }
-      const reqId = ++reqSeq;
-      pendingIo.set(reqId, { resolve, reject });
-      activePort.postMessage({ token: TOKEN, type: 'io_req', reqId, kind, payload });
-    });
-
-  const memoryStorage = (() => {
-    const store = new Map();
-    return {
-      get length() { return store.size; },
-      clear() { store.clear(); },
-      getItem(k) { return store.has(String(k)) ? store.get(String(k)) : null; },
-      key(i) { return Array.from(store.keys())[i] ?? null; },
-      removeItem(k) { store.delete(String(k)); },
-      setItem(k, v) { store.set(String(k), String(v)); },
-    };
-  })();
-
-  const nativeFetch = typeof fetch === 'function' ? fetch.bind(globalThis) : null;
-  const guardedFetch = async (input, init) => {
-    const rawUrl = typeof input === 'string' ? input : (input && input.url) || String(input);
-    const parsed = new URL(rawUrl, 'https://sandbox.invalid');
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('SecurityError: Blocked fetch protocol ' + parsed.protocol);
-    }
-    if (!nativeFetch) throw new Error('SandboxError: fetch unavailable');
-    return nativeFetch(parsed.toString(), init);
+  // Fail closed when Node V8 vm is unavailable instead of ever falling back to new Function()
+  const durationMs = Number((performance.now() - start).toFixed(2));
+  return {
+    logs,
+    pointerEvents: [],
+    durationMs,
+    error:
+      'SecurityError: Synchronous new Function() realm is disabled. Use runEasyJSAsync() (CSP-isolated iframe builder) or ASTInterpreter in browser environments.',
   };
-
-  window.addEventListener('message', async (event) => {
-    const data = event.data;
-    if (!data || data.token !== TOKEN || data.type !== 'init_port' || !event.ports || !event.ports[0]) {
-      return;
-    }
-    activePort = event.ports[0];
-
-    activePort.onmessage = async (msgEvent) => {
-      const msg = msgEvent.data;
-      if (!msg || msg.token !== TOKEN) return;
-
-      if (msg.type === 'io_res') {
-        const entry = pendingIo.get(msg.reqId);
-        if (entry) {
-          pendingIo.delete(msg.reqId);
-          if (msg.error) entry.reject(new Error(msg.error));
-          else entry.resolve(msg.result);
-        }
-        return;
-      }
-
-      if (msg.type === 'gui_event') {
-        if (typeof guiDispatcher === 'function') {
-          try {
-            await guiDispatcher(msg.elementId, msg.eventType, msg.payload);
-          } catch (err) {
-            activePort.postMessage({
-              token: TOKEN,
-              type: 'log',
-              line: '[error] ' + (err && err.message ? err.message : String(err))
-            });
-          }
-        }
-        return;
-      }
-
-      if (msg.type === 'exec') {
-        const logs = [];
-        const capturedConsole = {
-          log: (...args) => {
-            const line = args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ');
-            logs.push(line);
-            activePort.postMessage({ token: TOKEN, type: 'log', line });
-          },
-          warn: (...args) => {
-            const line = '[warn] ' + args.map((a) => String(a)).join(' ');
-            logs.push(line);
-            activePort.postMessage({ token: TOKEN, type: 'log', line });
-          },
-          error: (...args) => {
-            const line = '[error] ' + args.map((a) => String(a)).join(' ');
-            logs.push(line);
-            activePort.postMessage({ token: TOKEN, type: 'log', line });
-          },
-        };
-
-        const ioHandler = {
-          sandboxed: true,
-          onInput: (promptText) => sendIoRpc('input', { promptText }),
-          onAlert: (message) => sendIoRpc('alert', { message }),
-          onConfirm: (message) => sendIoRpc('confirm', { message }),
-          onPrompt: (message, defaultValue) => sendIoRpc('prompt', { message, defaultValue }),
-          onEcho: (promptText, val) => activePort.postMessage({ token: TOKEN, type: 'echo', promptText, val }),
-          onBrowser: (url) => activePort.postMessage({ token: TOKEN, type: 'browser', url }),
-          onVisual: (item) => activePort.postMessage({ token: TOKEN, type: 'visual', item }),
-          onServerStart: (portNum, routes) => activePort.postMessage({ token: TOKEN, type: 'server_start', portNum, routes }),
-          registerGuiDispatcher: (fn) => { guiDispatcher = fn; },
-        };
-
-        const safeLocation = Object.freeze({
-          href: 'https://sandbox.easyjs.local/',
-          pathname: '/',
-          hostname: 'sandbox.easyjs.local',
-          origin: 'https://sandbox.easyjs.local',
-          protocol: 'https:',
-          search: '',
-          hash: '',
-        });
-
-        const scope = {
-          Object, Array, String, Number, Boolean, Math, Date, JSON, RegExp,
-          Map, Set, WeakMap, WeakSet, Promise, Error, TypeError, RangeError,
-          SyntaxError, ReferenceError, URIError, EvalError, Symbol, BigInt,
-          Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
-          Int32Array, Uint32Array, Float32Array, Float64Array, ArrayBuffer, DataView,
-          Proxy, Reflect, Infinity, NaN, undefined,
-          parseInt, parseFloat, isNaN, isFinite,
-          encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
-          atob, btoa, setTimeout, clearTimeout, setInterval, clearInterval,
-          queueMicrotask, URL, URLSearchParams, TextEncoder, TextDecoder, crypto,
-          console: capturedConsole,
-          __ejs_stdin: Array.isArray(msg.stdin) ? msg.stdin : [],
-          __ejs_io: ioHandler,
-          localStorage: memoryStorage,
-          sessionStorage: memoryStorage,
-          location: safeLocation,
-          fetch: guardedFetch,
-          window: undefined,
-          document: undefined,
-          self: undefined,
-          top: undefined,
-          parent: undefined,
-          frames: undefined,
-          opener: undefined,
-          navigator: undefined,
-          history: undefined,
-          indexedDB: undefined,
-          cookieStore: undefined,
-          XMLHttpRequest: undefined,
-          WebSocket: undefined,
-          Worker: undefined,
-          SharedWorker: undefined,
-          ServiceWorker: undefined,
-          importScripts: undefined,
-          eval: () => { throw new Error('SecurityError: eval() is disabled inside the EasyJS sandbox'); },
-          Function: function BlockedFn() { throw new Error('SecurityError: Function() is disabled inside the EasyJS sandbox'); },
-        };
-        scope.globalThis = scope;
-
-        const proxy = new Proxy(scope, {
-          has() { return true; },
-          get(target, prop) {
-            if (prop === Symbol.unscopables) return undefined;
-            if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(target, prop)) {
-              return target[prop];
-            }
-            return undefined;
-          },
-          set(target, prop, value) {
-            if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') return false;
-            target[String(prop)] = value;
-            return true;
-          },
-        });
-
-        try {
-          const runner = new Function('__s', 'with (__s) { return (function() { "use strict"; return (async () => { ' + msg.code + '\n if (typeof __ejs !== "undefined" && __ejs.yourgui && typeof __ejs.yourgui.flush === "function") { __ejs.yourgui.flush(); } return typeof __ejs !== "undefined" ? { pointerEvents: __ejs.pointerEvents, visualOutputs: __ejs.visualOutputs || [], registeredRoutes: (__ejs.registeredRoutes || []).map(r => ({ method: r.method, path: r.path })) } : { pointerEvents: [], visualOutputs: [], registeredRoutes: [] }; })(); }).call(undefined); }');
-          const meta = (await runner(proxy)) || {};
-          activePort.postMessage({
-            token: TOKEN,
-            type: 'done',
-            logs,
-            meta,
-            hasInteractiveGui: typeof guiDispatcher === 'function',
-          });
-        } catch (err) {
-          activePort.postMessage({
-            token: TOKEN,
-            type: 'error',
-            logs,
-            isExitSignal: Boolean(err && typeof err === 'object' && err.isExitSignal === true),
-            message: err && err.message ? err.message : String(err),
-          });
-        }
-      }
-    };
-
-    activePort.start();
-    activePort.postMessage({ token: TOKEN, type: 'port_ready' });
-  });
-
-  window.parent.postMessage({ token: TOKEN, type: 'iframe_ready' }, '*');
-})();
-</script>
-</body>
-</html>`;
 }
 
 let activeSandboxIframeCleanup: (() => void) | null = null;
@@ -627,7 +432,8 @@ export function disposeActiveBrowserSandbox(): void {
 
 async function runInBrowserIframeSandbox(
   code: string,
-  options: SandboxIoOptions
+  options: SandboxIoOptions,
+  policy: CompilerSecurityPolicy
 ): Promise<ExecutionResult | null> {
   if (
     typeof document === 'undefined' ||
@@ -638,14 +444,21 @@ async function runInBrowserIframeSandbox(
     return null;
   }
 
-  disposeActiveBrowserSandbox();
+  if (!options.ephemeral) {
+    disposeActiveBrowserSandbox();
+  }
 
   const token = 'ejs_sb_' + Math.random().toString(36).slice(2) + '_' + Date.now();
   const iframe = document.createElement('iframe');
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.setAttribute('aria-hidden', 'true');
   iframe.style.display = 'none';
-  iframe.srcdoc = buildIframeSandboxSrcDoc(token);
+  iframe.srcdoc = buildBrowserSandboxDocument({
+    code,
+    token,
+    policy,
+    stdin: options.stdin ?? [],
+  });
 
   const start = performance.now();
   const logs: string[] = [];
@@ -670,7 +483,9 @@ async function runInBrowserIframeSandbox(
     }
   };
 
-  activeSandboxIframeCleanup = cleanup;
+  if (!options.ephemeral) {
+    activeSandboxIframeCleanup = cleanup;
+  }
 
   if (options.signal) {
     if (options.signal.aborted) {
@@ -687,7 +502,7 @@ async function runInBrowserIframeSandbox(
       if (!handshakeResolved) {
         window.removeEventListener('message', onWindowMessage);
         cleanup();
-        resolve(null); // Fallback if headless DOM does not execute srcdoc scripts
+        resolve(null);
       }
     }, 800);
 
@@ -726,7 +541,6 @@ async function runInBrowserIframeSandbox(
         channel.port1.postMessage({
           token,
           type: 'exec',
-          code,
           stdin: options.stdin ?? [],
         });
         return;
@@ -849,6 +663,8 @@ export async function runAsyncInSandbox(
   code: string,
   options: SandboxIoOptions = {}
 ): Promise<ExecutionResult> {
+  const policy = new SecurityPolicyManager(options.securityPolicy).policy;
+
   // 1. Node.js isolated V8 VM context
   const vm = getNodeVm();
   if (vm) {
@@ -869,17 +685,47 @@ export async function runAsyncInSandbox(
     };
 
     try {
-      const vmScope = buildSafeSandboxScope(capturedConsole, options.stdin ?? [], ioHandler);
-      const context = vm.createContext(vmScope, {
-        name: 'EasyJSAsyncSandbox',
-        codeGeneration: { strings: false, wasm: false },
-      });
-      const wrapped = `(() => {\n${wrapCompiledCodeAsync(code)}\n})()`;
+      const context = createHardenedVmContext(
+        vm,
+        'EasyJSAsyncSandbox',
+        capturedConsole,
+        options.stdin ?? [],
+        ioHandler,
+        policy
+      );
+      const wrapped = `(() => {\n${wrapCompiledCodeAsync(code, policy.globals.globalThisMode, false)}\n})()`;
       const promise = vm.runInContext(wrapped, context, {
         timeout: DEFAULT_SYNC_TIMEOUT_MS,
         filename: 'easyjs-async-sandbox.js',
       }) as Promise<Record<string, unknown>>;
-      const meta = ((await promise) ?? {}) as {
+      const meta = ((await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`SecurityError: Async sandbox execution timed out after ${DEFAULT_SYNC_TIMEOUT_MS}ms`));
+        }, DEFAULT_SYNC_TIMEOUT_MS);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new Error('SecurityError: Execution cancelled by user'));
+        };
+        if (options.signal) {
+          if (options.signal.aborted) {
+            onAbort();
+            return;
+          }
+          options.signal.addEventListener('abort', onAbort, { once: true });
+        }
+        Promise.resolve(promise).then(
+          (val) => {
+            clearTimeout(timer);
+            options.signal?.removeEventListener('abort', onAbort);
+            resolve(val);
+          },
+          (err) => {
+            clearTimeout(timer);
+            options.signal?.removeEventListener('abort', onAbort);
+            reject(err);
+          }
+        );
+      })) ?? {}) as {
         pointerEvents?: PointerRuntimeEvent[];
         visualOutputs?: VisualOutputItem[];
         registeredRoutes?: RegisteredRouteInfo[];
@@ -906,57 +752,18 @@ export async function runAsyncInSandbox(
     }
   }
 
-  // 2. Real Browser Opaque-Origin Iframe Sandbox (<iframe sandbox="allow-scripts">)
-  const iframeResult = await runInBrowserIframeSandbox(code, options);
+  // 2. Real Browser Opaque-Origin CSP Iframe Sandbox (<iframe sandbox="allow-scripts">, zero new Function())
+  const iframeResult = await runInBrowserIframeSandbox(code, options, policy);
   if (iframeResult) {
     return iframeResult;
   }
 
-  // 3. Fallback Proxy-Isolated Realm Sandbox (e.g., headless DOM without iframe script execution)
-  const logs: string[] = [];
-  const start = performance.now();
-  const capturedConsole = createCapturedConsole(logs, options.onLog);
-  const ioHandler: Record<string, unknown> = {
-    sandboxed: true,
-    onInput: options.onInput,
-    onEcho: options.onEcho,
-    onAlert: options.onAlert,
-    onConfirm: options.onConfirm,
-    onPrompt: options.onPrompt,
-    onBrowser: options.onBrowser,
-    onVisual: options.onVisual,
-    onServerStart: options.onServerStart,
-    registerGuiDispatcher: options.registerGuiDispatcher,
+  // 3. Fail closed instead of ever calling new Function() or eval()
+  return {
+    logs: [],
+    pointerEvents: [],
+    durationMs: 0,
+    error:
+      'SecurityError: No isolated sandbox runtime (Node V8 VM or CSP-isolated iframe) is available. Unsafe new Function() fallback is disabled.',
   };
-
-  try {
-    const scope = buildSafeSandboxScope(capturedConsole, options.stdin ?? [], ioHandler);
-    const meta = ((await runWithProxyRealm<Promise<Record<string, unknown>>>(
-      wrapCompiledCodeAsync(code),
-      scope
-    )) ?? {}) as {
-      pointerEvents?: PointerRuntimeEvent[];
-      visualOutputs?: VisualOutputItem[];
-      registeredRoutes?: RegisteredRouteInfo[];
-    };
-    const durationMs = Number((performance.now() - start).toFixed(2));
-    return {
-      logs,
-      pointerEvents: meta.pointerEvents ?? [],
-      visualOutputs: meta.visualOutputs ?? [],
-      registeredRoutes: meta.registeredRoutes ?? [],
-      durationMs,
-    };
-  } catch (err) {
-    const durationMs = Number((performance.now() - start).toFixed(2));
-    if (isExitSignalError(err)) {
-      return { logs, pointerEvents: [], durationMs, haltedByExit: true };
-    }
-    return {
-      logs,
-      pointerEvents: [],
-      durationMs,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
 }

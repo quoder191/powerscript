@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 
 export type WorkspaceTab = 'workspace' | 'guide' | 'tests';
-export type ExecutionEngine = 'interpreter' | 'compiled';
+export type ExecutionEngine = 'server-sandbox' | 'interpreter' | 'compiled';
 
 export interface ExamplePreset {
   id: string;
@@ -169,8 +169,9 @@ export function Toolbar({
               onChange={(e) => onSelectEngine(e.target.value as ExecutionEngine)}
               className="px-2.5 py-1.5 text-xs font-medium bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-md focus-visible:outline-2 focus-visible:outline-emerald-600"
             >
+              <option value="server-sandbox">Server Sandbox (OS + VM)</option>
               <option value="interpreter">AST Interpreter (Zero-eval)</option>
-              <option value="compiled">Compiled JS</option>
+              <option value="compiled">Browser Sandbox (Iframe + VM)</option>
             </select>
           </div>
 

@@ -70,8 +70,11 @@ export interface ExecutionResult {
   haltedByExit?: boolean;
 }
 
+import type { PartialCompilerSecurityPolicy } from '../security-policy.ts';
+
 export interface ExecuteSyncOptions {
   stdin?: string[];
+  securityPolicy?: PartialCompilerSecurityPolicy;
 }
 
 export type GuiEventDispatcher = (
@@ -99,6 +102,8 @@ export interface ExecuteAsyncOptions {
   onServerStart?: (port: number, routes: RegisteredRouteInfo[]) => void;
   registerGuiDispatcher?: (dispatcher: GuiEventDispatcher) => void;
   signal?: AbortSignal;
+  securityPolicy?: PartialCompilerSecurityPolicy;
+  ephemeral?: boolean;
 }
 
 export { disposeActiveBrowserSandbox };

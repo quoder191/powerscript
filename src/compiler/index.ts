@@ -56,6 +56,19 @@ import {
 } from './security-analyzer.ts';
 
 import {
+  CapabilitySecurityManager,
+} from './capability-security.ts';
+
+import {
+  SecurityPolicyManager,
+  type PartialCompilerSecurityPolicy,
+} from './security-policy.ts';
+
+import {
+  TypeChecker,
+} from './type-checker.ts';
+
+import {
   DiagnosticSeverity as SecurityDiagnosticSeverity,
 } from './types.ts';
 
@@ -91,6 +104,13 @@ export interface IncrementalStats {
 // COMPILATION RESULT
 // ==========================================
 
+export interface SecurityVerdict {
+  approved: boolean;
+  analysisComplete: boolean;
+  blockedCount: number;
+  blockedReasons: string[];
+}
+
 export interface CompileResult {
   success: boolean;
 
@@ -119,6 +139,8 @@ export interface CompileResult {
   timings: CompileTimings;
 
   security?: SecurityAnalyzerResult | null;
+
+  securityVerdict: SecurityVerdict;
 }
 
 // ==========================================
@@ -127,6 +149,7 @@ export interface CompileResult {
 
 export interface CompileOptions extends GeneratorOptions {
   optimize?: OptimizeOptions | false;
+  securityPolicy?: PartialCompilerSecurityPolicy;
 }
 
 // ==========================================
@@ -281,8 +304,10 @@ export function compileEasyJS(
   );
 
   // ========================================
-  // PHASE 5: INITIAL DIAGNOSTICS
+  // PHASE 5: STATIC TYPE CHECKER & DIAGNOSTICS
   // ========================================
+
+  const policyManager = new SecurityPolicyManager(options.securityPolicy);
 
   const diagnostics: CompilerDiagnostic[] = [
 
@@ -294,47 +319,96 @@ export function compileEasyJS(
 
   ];
 
-  const previousErrors = diagnostics.some(
+  const hasLexOrParseErrors =
+    lexResult.diagnostics.some((d) => d.severity === 'error') ||
+    parseResult.diagnostics.some((d) => d.severity === 'error');
+
+  const hasParseOrTransformErrors = diagnostics.some(
     (diagnostic) => diagnostic.severity === 'error'
   );
 
+  if (!hasLexOrParseErrors) {
+    const typeChecker = new TypeChecker(policyManager.policy.typeSafety);
+    const typeResult = typeChecker.check(transformResult.ast);
+    for (const td of typeResult.diagnostics) {
+      const isDup = diagnostics.some(
+        (existing) =>
+          existing.line === td.line &&
+          existing.message === td.message
+      );
+      if (!isDup) {
+        diagnostics.push(td);
+      }
+    }
+  }
+
   // ========================================
-  // PHASE 6: SECURITY ANALYSIS
+  // PHASE 6: FAIL-CLOSED SECURITY & CAPABILITY ANALYSIS
   // ========================================
 
   const securityStart = performance.now();
 
   let securityResult: SecurityAnalyzerResult | null = null;
+  let securityAnalysisComplete = false;
 
-  if (!previousErrors) {
+  if (!hasLexOrParseErrors) {
 
     const securityAnalyzer = new SecurityAnalyzer({
       stopOnFirstError: false,
+      policy: policyManager.policy.ownership,
     });
 
     securityResult = securityAnalyzer.analyze(
       transformResult.ast
     );
 
-    // Convert security diagnostics into
-    // compiler-compatible diagnostics.
-
-    diagnostics.push(
-      ...convertSecurityDiagnostics(securityResult)
+    const capabilityManager = new CapabilitySecurityManager(
+      options.securityPolicy
+    );
+    const capabilityResult = capabilityManager.analyze(
+      transformResult.ast
     );
 
-    // Report any remaining non-fatal incomplete analysis note as info only
-    // so normal programs are never blocked by control-flow heuristics.
-    if (!securityResult.analysisComplete) {
-      diagnostics.push({
-        phase: 'transformer',
-        severity: 'info',
-        title: 'Security Analysis Note',
-        message:
-          'Security analyzer skipped partial control-flow verification for dynamic constructs.',
-        line: 1,
-        column: 1,
-      });
+    securityAnalysisComplete =
+      securityResult.analysisComplete && capabilityResult.analysisComplete;
+
+    const mergedSecurityDiagnostics = [
+      ...securityResult.diagnostics,
+      ...capabilityResult.diagnostics,
+    ];
+    const combinedSecurity: SecurityAnalyzerResult = {
+      success:
+        securityResult.success &&
+        capabilityResult.success &&
+        securityAnalysisComplete,
+      diagnostics: mergedSecurityDiagnostics,
+      errorCount: securityResult.errorCount + capabilityResult.errorCount,
+      warningCount: securityResult.warningCount + capabilityResult.warningCount,
+      analysisComplete: securityAnalysisComplete,
+      incompleteReasons: [...securityResult.incompleteReasons],
+    };
+    securityResult = combinedSecurity;
+
+    diagnostics.push(
+      ...convertSecurityDiagnostics(combinedSecurity)
+    );
+
+    if (!securityAnalysisComplete) {
+      const alreadyHasSec000 = diagnostics.some(
+        (d) => d.severity === 'error' && d.title === 'Security SEC000'
+      );
+      if (!alreadyHasSec000) {
+        diagnostics.push({
+          phase: 'transformer',
+          severity: 'error',
+          title: 'Security SEC000',
+          message:
+            'Incomplete Security Analysis: Compilation blocked because the security analyzer could not completely verify the program.',
+          line: 1,
+          column: 1,
+          hint: 'Execution is denied whenever security analysis is incomplete (fail-closed policy).',
+        });
+      }
     }
   }
 
@@ -346,9 +420,22 @@ export function compileEasyJS(
   // PHASE 7: COMPILATION VALIDATION
   // ========================================
 
-  const hasErrors = diagnostics.some(
+  const errorDiagnostics = diagnostics.filter(
     (diagnostic) => diagnostic.severity === 'error'
   );
+  const securityApproved =
+    !hasParseOrTransformErrors &&
+    securityAnalysisComplete &&
+    Boolean(securityResult?.success) &&
+    errorDiagnostics.length === 0;
+  const hasErrors = errorDiagnostics.length > 0 || !securityApproved;
+
+  const securityVerdict: SecurityVerdict = {
+    approved: securityApproved,
+    analysisComplete: securityAnalysisComplete,
+    blockedCount: errorDiagnostics.length,
+    blockedReasons: errorDiagnostics.map((d) => `${d.title}: ${d.message}`),
+  };
 
   // ========================================
   // PHASE 8: OPTIMIZER
@@ -503,6 +590,8 @@ export function compileEasyJS(
 
     security: securityResult,
 
+    securityVerdict,
+
   };
 }
 
@@ -525,7 +614,7 @@ export function runEasyJS(
 
   const compiled = compileEasyJS(
     source,
-    { interactiveAsync: false }
+    { interactiveAsync: false, securityPolicy: options.securityPolicy }
   );
 
   if (!compiled.success) {
@@ -554,7 +643,7 @@ export async function runEasyJSAsync(
 
   const compiled = compileEasyJS(
     source,
-    { interactiveAsync: true }
+    { interactiveAsync: true, securityPolicy: options.securityPolicy }
   );
 
   if (!compiled.success) {
@@ -583,7 +672,7 @@ export async function runEasyJSInterpreted(
 
   const compiled = compileEasyJS(
     source,
-    { optimize: false }
+    { optimize: false, securityPolicy: options.securityPolicy }
   );
 
   if (!compiled.success) {
@@ -640,6 +729,15 @@ export function createEasyJSDebugger(
 
 export { formatEasyJS } from './formatter.ts';
 export { disposeActiveBrowserSandbox } from './utils/helpers.ts';
+export {
+  SandboxBuilderEngine,
+  SANDBOX_SHADOWED_GLOBALS,
+  buildBrowserSandboxDocument,
+  buildLexicallyIsolatedInvocation,
+  escapeInlineScriptTag,
+  type BrowserSandboxDocumentOptions,
+  type LexicalIsolationBuildOptions,
+} from './builder-engine.ts';
 
 export {
   ASTInterpreter,
@@ -671,16 +769,27 @@ export * from './utils/helpers.ts';
 // Security API
 
 export { SecurityAnalyzer };
+export { TypeChecker, type TypeCheckResult } from './type-checker.ts';
 
 export {
   OwnerState,
+  OwnerKind,
   BorrowKind,
   DiagnosticSeverity as SecurityDiagnosticSeverity,
   DEFAULT_SECURITY_POLICY,
+  DEFAULT_SECURITY_POLICY as SECURITY_POLICY_DEFAULT,
   DiagnosticBag,
   OwnershipModel,
   BorrowChecker,
   PowerScriptSecurityEngine,
+  SecurityPolicyManager,
+  NetworkPolicyManager,
+  CapabilitySecurityManager,
+  DEFAULT_COMPILER_SECURITY_POLICY,
+  DEFAULT_NETWORK_SECURITY_POLICY,
+  DEFAULT_GLOBAL_ACCESS_POLICY,
+  DEFAULT_TYPE_SAFETY_POLICY,
+  DEFAULT_BLOCKED_HEADERS,
 } from './security-index.ts';
 
 export type {
@@ -692,5 +801,13 @@ export type {
   SecurityAnalysisResult,
   SecurityOperation,
   SecurityOperationType,
+  GlobalThisPolicyMode,
+  NetworkSecurityPolicy,
+  GlobalAccessPolicy,
+  TypeSafetyPolicy,
+  CompilerSecurityPolicy,
+  PartialCompilerSecurityPolicy,
+  FetchValidationResult,
+  CapabilitySecurityResult,
 } from './security-index.ts';
   

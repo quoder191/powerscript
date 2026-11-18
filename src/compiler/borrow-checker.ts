@@ -1,4 +1,3 @@
-
 /**
  * PowerScript Security Engine
  * Borrow Checker
@@ -26,6 +25,10 @@ export class BorrowChecker {
         this.diagnostics = diagnostics;
     }
 
+    private displayName(ownerId: string): string {
+        return this.ownership.getOwner(ownerId)?.name ?? ownerId;
+    }
+
     // ======================================
     // 1. Validate shared borrowing
     // ======================================
@@ -40,18 +43,14 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR001",
-                `Cannot borrow unavailable owner '${ownerId}'.`,
-                location
+                `Cannot borrow unavailable owner '${this.displayName(ownerId)}'.`,
+                location,
+                "Ensure the owner has not been moved or dropped before borrowing."
             );
             return false;
         }
 
-        const borrows = this.ownership.getAllBorrows().filter(
-            borrow =>
-                borrow.ownerId === ownerId &&
-                borrow.active
-        );
-
+        const borrows = this.ownership.getActiveBorrows(ownerId);
         const hasMutableBorrow = borrows.some(
             borrow => borrow.kind === BorrowKind.MUTABLE
         );
@@ -59,8 +58,9 @@ export class BorrowChecker {
         if (hasMutableBorrow) {
             this.diagnostics.error(
                 "BOR002",
-                `Cannot create shared borrow while a mutable borrow exists.`,
-                location
+                `Cannot create shared borrow of '${owner.name}' while a mutable borrow exists.`,
+                location,
+                "A value cannot have shared readers while an exclusive mutable borrow is active."
             );
             return false;
         }
@@ -82,23 +82,20 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR003",
-                `Cannot mutably borrow unavailable owner '${ownerId}'.`,
+                `Cannot mutably borrow unavailable owner '${this.displayName(ownerId)}'.`,
                 location
             );
             return false;
         }
 
-        const borrows = this.ownership.getAllBorrows().filter(
-            borrow =>
-                borrow.ownerId === ownerId &&
-                borrow.active
-        );
+        const borrows = this.ownership.getActiveBorrows(ownerId);
 
         if (borrows.length > 0) {
             this.diagnostics.error(
                 "BOR004",
-                `Cannot create mutable borrow while another borrow exists.`,
-                location
+                `Cannot create mutable borrow of '${owner.name}' while another borrow exists.`,
+                location,
+                "End all existing shared or mutable borrows before creating a mutable borrow."
             );
             return false;
         }
@@ -112,7 +109,8 @@ export class BorrowChecker {
 
     checkOwnerMutation(
         ownerId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        allowInteriorUnderShared = false
     ): boolean {
 
         const owner = this.ownership.getOwner(ownerId);
@@ -120,23 +118,21 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR005",
-                `Cannot modify unavailable owner '${ownerId}'.`,
+                `Cannot modify unavailable owner '${this.displayName(ownerId)}'.`,
                 location
             );
             return false;
         }
 
-        const borrows = this.ownership.getAllBorrows().filter(
-            borrow =>
-                borrow.ownerId === ownerId &&
-                borrow.active
-        );
+        const borrows = this.ownership.getActiveBorrows(ownerId);
+        const hasMutable = borrows.some(b => b.kind === BorrowKind.MUTABLE);
 
-        if (borrows.length > 0) {
+        if (hasMutable || (!allowInteriorUnderShared && borrows.length > 0)) {
             this.diagnostics.error(
                 "BOR006",
-                `Cannot directly modify an owner while it is borrowed.`,
-                location
+                `Cannot directly modify '${owner.name}' while it is borrowed.`,
+                location,
+                "Release active borrows before mutating or rebinding the owner."
             );
             return false;
         }
@@ -158,18 +154,13 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR007",
-                `Cannot read unavailable owner '${ownerId}'.`,
+                `Cannot read unavailable owner '${this.displayName(ownerId)}'.`,
                 location
             );
             return false;
         }
 
-        const borrows = this.ownership.getAllBorrows().filter(
-            borrow =>
-                borrow.ownerId === ownerId &&
-                borrow.active
-        );
-
+        const borrows = this.ownership.getActiveBorrows(ownerId);
         const hasMutableBorrow = borrows.some(
             borrow => borrow.kind === BorrowKind.MUTABLE
         );
@@ -177,8 +168,9 @@ export class BorrowChecker {
         if (hasMutableBorrow) {
             this.diagnostics.error(
                 "BOR008",
-                `Cannot directly read owner while a mutable borrow exists.`,
-                location
+                `Cannot directly read '${owner.name}' while a mutable borrow exists.`,
+                location,
+                "Read through the mutable borrow or wait until the mutable borrow ends."
             );
             return false;
         }
@@ -195,9 +187,7 @@ export class BorrowChecker {
         location?: SourceLocation
     ): boolean {
 
-        const borrow = this.ownership.getAllBorrows().find(
-            item => item.id === borrowId
-        );
+        const borrow = this.ownership.getBorrow(borrowId);
 
         if (!borrow) {
             this.diagnostics.error(
@@ -211,7 +201,18 @@ export class BorrowChecker {
         if (!borrow.active) {
             this.diagnostics.error(
                 "BOR010",
-                `Borrow '${borrowId}' is no longer active.`,
+                `Borrow '${borrowId}' is no longer active (dangling reference).`,
+                location,
+                "The borrowed owner is no longer accessible through this borrow."
+            );
+            return false;
+        }
+
+        const owner = this.ownership.getOwner(borrow.ownerId);
+        if (!owner || owner.state !== OwnerState.ACTIVE) {
+            this.diagnostics.error(
+                "BOR010",
+                `Cannot use borrow of '${this.displayName(borrow.ownerId)}' because the owner was moved or dropped.`,
                 location
             );
             return false;
@@ -233,15 +234,14 @@ export class BorrowChecker {
             return false;
         }
 
-        const borrow = this.ownership.getAllBorrows().find(
-            item => item.id === borrowId
-        );
+        const borrow = this.ownership.getBorrow(borrowId);
 
         if (!borrow || borrow.kind !== BorrowKind.MUTABLE) {
             this.diagnostics.error(
                 "BOR011",
-                `Borrow '${borrowId}' is not mutable.`,
-                location
+                `Cannot mutate through immutable shared borrow of '${this.displayName(borrow?.ownerId ?? borrowId)}'.`,
+                location,
+                "Use a mutable reference (`mut ref` / `int&`) to mutate borrowed data."
             );
             return false;
         }
@@ -262,9 +262,7 @@ export class BorrowChecker {
             return false;
         }
 
-        const borrow = this.ownership.getAllBorrows().find(
-            item => item.id === borrowId
-        );
+        const borrow = this.ownership.getBorrow(borrowId);
 
         if (!borrow || borrow.kind !== BorrowKind.SHARED) {
             this.diagnostics.error(
@@ -292,7 +290,7 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR013",
-                `Cannot move unavailable owner '${ownerId}'.`,
+                `Cannot move unavailable owner '${this.displayName(ownerId)}'.`,
                 location
             );
             return false;
@@ -301,7 +299,7 @@ export class BorrowChecker {
         if (this.ownership.hasActiveBorrows(ownerId)) {
             this.diagnostics.error(
                 "BOR014",
-                `Cannot move owner while active borrows exist.`,
+                `Cannot move '${owner.name}' while active borrows exist.`,
                 location
             );
             return false;
@@ -324,7 +322,7 @@ export class BorrowChecker {
         if (!owner || owner.state !== OwnerState.ACTIVE) {
             this.diagnostics.error(
                 "BOR015",
-                `Cannot drop unavailable owner '${ownerId}'.`,
+                `Cannot drop unavailable owner '${this.displayName(ownerId)}'.`,
                 location
             );
             return false;
@@ -333,7 +331,7 @@ export class BorrowChecker {
         if (this.ownership.hasActiveBorrows(ownerId)) {
             this.diagnostics.error(
                 "BOR016",
-                `Cannot drop owner while active borrows exist.`,
+                `Cannot drop '${owner.name}' while active borrows exist.`,
                 location
             );
             return false;
@@ -341,5 +339,30 @@ export class BorrowChecker {
 
         return true;
     }
+
+    // ======================================
+    // 10. Validate lifetime / dangling reference prevention
+    // ======================================
+
+    checkLifetimeEscape(
+        ownerId: string,
+        targetScopeDepth: number,
+        contextDescription: string,
+        location?: SourceLocation
+    ): boolean {
+        const owner = this.ownership.getOwner(ownerId);
+        if (!owner) return true;
+
+        if (owner.scopeDepth > targetScopeDepth) {
+            this.diagnostics.error(
+                "BOR017",
+                `Dangling reference: '${owner.name}' does not live long enough (${contextDescription}).`,
+                location,
+                `Move ownership instead of returning or storing a reference to a shorter-lived local variable '${owner.name}'.`
+            );
+            return false;
         }
-          
+
+        return true;
+    }
+}

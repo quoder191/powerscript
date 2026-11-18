@@ -15,6 +15,13 @@ export enum OwnerState {
     INVALID = "invalid"
 }
 
+export enum OwnerKind {
+    UNIQUE = "unique",
+    SHARED = "shared",
+    WEAK = "weak",
+    RAW = "raw"
+}
+
 // ==========================================
 // 2. Borrowing Types
 // ==========================================
@@ -66,8 +73,11 @@ export interface OwnerRecord {
     id: string;
     name: string;
     state: OwnerState;
+    kind: OwnerKind;
 
     scopeId: string;
+    scopeDepth: number;
+    refCount: number;
 
     createdAt?: SourceLocation;
     movedAt?: SourceLocation;
@@ -86,6 +96,7 @@ export interface BorrowRecord {
     kind: BorrowKind;
 
     scopeId: string;
+    scopeDepth: number;
 
     active: boolean;
 
@@ -106,6 +117,9 @@ export interface SecurityPolicy {
     // Borrowing rules
     forbidMoveWhileBorrowed: boolean;
     forbidDropWhileBorrowed: boolean;
+    forbidDanglingReferences: boolean;
+    forbidMutableBorrowAliasing: boolean;
+    forbidDirectMutationDuringMutableBorrow: boolean;
 
     // Borrow lifecycle
     requireExplicitBorrowEnd: boolean;
@@ -129,6 +143,9 @@ export const DEFAULT_SECURITY_POLICY: SecurityPolicy = {
 
     forbidMoveWhileBorrowed: true,
     forbidDropWhileBorrowed: true,
+    forbidDanglingReferences: true,
+    forbidMutableBorrowAliasing: true,
+    forbidDirectMutationDuringMutableBorrow: true,
 
     requireExplicitBorrowEnd: true,
 

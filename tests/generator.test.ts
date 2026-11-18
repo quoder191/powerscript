@@ -1,15 +1,25 @@
-import { compileEasyJS, formatEasyJS, runEasyJS } from '../src/compiler/index.ts';
+import {
+  buildBrowserSandboxDocument,
+  buildLexicallyIsolatedInvocation,
+  CapabilitySecurityManager,
+  compileEasyJS,
+  formatEasyJS,
+  runEasyJSAsync,
+  SandboxBuilderEngine,
+  SecurityAnalyzer,
+  SecurityPolicyManager,
+} from '../src/compiler/index.ts';
 import type { TestCaseResult } from './lexer.test.ts';
 
 function assertTrue(cond: boolean, message: string): void {
   if (!cond) throw new Error(message);
 }
 
-export function runGeneratorTests(): TestCaseResult[] {
-  const tests: Array<{ name: string; fn: () => void }> = [
+export async function runGeneratorTests(): Promise<TestCaseResult[]> {
+  const tests: Array<{ name: string; fn: () => Promise<void> | void }> = [
     {
       name: 'Compiles and executes OOP class hierarchy with f-strings',
-      fn: () => {
+      fn: async () => {
         const src = `
           trait Describable {
             fn describe() -> str
@@ -33,7 +43,7 @@ export function runGeneratorTests(): TestCaseResult[] {
           let t = new Task(7, "Ship Lexer")
           print(t.describe())
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, 'Expected successful compilation');
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === 'Task #7: Ship Lexer', 'Expected matching log output');
@@ -41,7 +51,7 @@ export function runGeneratorTests(): TestCaseResult[] {
     },
     {
       name: 'Compiles and executes algebraic enums with pattern matching',
-      fn: () => {
+      fn: async () => {
         const src = `
           enum Shape {
             Circle(radius),
@@ -56,14 +66,14 @@ export function runGeneratorTests(): TestCaseResult[] {
           }
           print(area(Shape.Rect(4, 5)))
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, 'Expected compilation success');
         assertTrue(out.execution?.logs[0] === '20', `Expected '20', got ${out.execution?.logs[0]}`);
       },
     },
     {
       name: 'Executes smart pointers, borrow, shared refCount, and defer',
-      fn: () => {
+      fn: async () => {
         const src = `
           fn demo() {
             defer print("deferred cleanup")
@@ -79,7 +89,7 @@ export function runGeneratorTests(): TestCaseResult[] {
           }
           demo()
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, 'Expected compilation success');
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === '250', 'Expected deref 250');
@@ -90,19 +100,19 @@ export function runGeneratorTests(): TestCaseResult[] {
     },
     {
       name: 'Executes range loops and functional pipelines',
-      fn: () => {
+      fn: async () => {
         const src = `
           let total = 1..=5 |> filter(fn(n) => n % 2 == 1) |> map(fn(n) => n * 10) |> sum()
           print(total)
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, 'Expected compilation success');
         assertTrue(out.execution?.logs[0] === '90', `Expected '90', got ${out.execution?.logs[0]}`);
       },
     },
     {
       name: 'Executes array, dictionary, Stack, Queue, text, and math operations',
-      fn: () => {
+      fn: async () => {
         const src = `
           var nums = [20, 3, 10, 3]
           nums.append(5)
@@ -125,7 +135,7 @@ export function runGeneratorTests(): TestCaseResult[] {
           print(raw.trim().upper())
           print((-15).abs(), toInt("7") + 3)
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, 'Expected compilation success');
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === '3,5,10,20', `Sorted array mismatch: ${out.execution?.logs[0]}`);
@@ -139,7 +149,7 @@ export function runGeneratorTests(): TestCaseResult[] {
     },
     {
       name: 'Executes interactive input(), inputInt(), and C-style for loops with stdin',
-      fn: () => {
+      fn: async () => {
         const src = `
           text name = input("Name: ")
           int n = inputInt("Count: ")
@@ -153,7 +163,7 @@ export function runGeneratorTests(): TestCaseResult[] {
           }
           print(f"{name}:{sum}:{band}")
         `;
-        const out = runEasyJS(src, { stdin: ['Sam', '5'] });
+        const out = await runEasyJSAsync(src, { stdin: ['Sam', '5'], ephemeral: true });
         assertTrue(out.success, 'Expected compilation success');
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === 'Sam:15:mid', `Expected 'Sam:15:mid', got ${out.execution?.logs[0]}`);
@@ -161,7 +171,7 @@ export function runGeneratorTests(): TestCaseResult[] {
     },
     {
       name: 'Executes standard library (Core, System, Stack) and scope isolation',
-      fn: () => {
+      fn: async () => {
         const src = `
           textVal = uppercase("hello")
           print(textVal, lowercase(textVal), length(textVal))
@@ -192,7 +202,7 @@ export function runGeneratorTests(): TestCaseResult[] {
           exit()
           print("should not print")
         `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compilation success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.haltedByExit === true, 'Expected clean exit() halt');
@@ -211,7 +221,7 @@ export function runGeneratorTests(): TestCaseResult[] {
     },
     {
       name: 'Executes extreme nested if/elif/else chains (12+ levels, mixed colon/braces, inline colons, and constant-if scoping)',
-      fn: () => {
+      fn: async () => {
         const src = `
 fn classify(a, b, c, d, e, f, g, h):
   result = "start"
@@ -273,7 +283,7 @@ print(classify(1, 1, 1, 1, 1, -1, 1, 1))
 print(classify(1, 0, 1, 1, 1, 1, 1, 1))
 print(classify(0, 1, 1, 1, 1, 1, 1, 1))
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === '100', `Expected 100, got ${out.execution?.logs[0]}`);
@@ -287,7 +297,7 @@ print(classify(0, 1, 1, 1, 1, 1, 1, 1))
     },
     {
       name: 'Executes multi-level constructors (init/constructor/super), default params, direct calls without new, and colon classes',
-      fn: () => {
+      fn: async () => {
         const src = `
 class Base:
   pub baseVal: int
@@ -323,7 +333,7 @@ print(a.summary())
 print(b.summary())
 print(c.baseVal)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === 'mid:15:90', `Expected mid:15:90, got ${out.execution?.logs[0]}`);
@@ -333,7 +343,7 @@ print(c.baseVal)
     },
     {
       name: 'Performs AST optimization, minification, source maps, and formatting',
-      fn: () => {
+      fn: async () => {
         const src = `
 fn unusedHelper() {
   return 999
@@ -358,7 +368,7 @@ print(folded)
     },
     {
       name: 'Executes all arrow functions, colon/brace arrow blocks, -> return annotations, match =>, and |> pipelines',
-      fn: () => {
+      fn: async () => {
         const src = `
 double = x => x * 2
 addBlock = (a: int, b: int) => {
@@ -386,7 +396,7 @@ ranked = match 88 {
 
 print(double(6), addBlock(2, 3), blockFn(4), colonArrow("ok"), sq(7), piped, ranked)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(
@@ -397,7 +407,7 @@ print(double(6), addBlock(2, 3), blockFn(4), colonArrow("ok"), sq(7), piped, ran
     },
     {
       name: 'Compiles and runs stdlib/yourgui with style {} block, elements, input() disambiguation, and arrow events',
-      fn: () => {
+      fn: async () => {
         const src = `
 import yourgui from "stdlib/yourgui"
 style {
@@ -414,7 +424,7 @@ onClick(btn, () => {
 })
 print(agree.checked, role.value)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === 'true Dev', `Expected checkbox/select state, got ${out.execution?.logs[0]}`);
@@ -428,7 +438,7 @@ print(agree.checked, role.value)
     },
     {
       name: 'Executes stdlib/server routes returning object literals from arrow functions',
-      fn: () => {
+      fn: async () => {
         const src = `
 server.get("/ping", req => ({ ok: true, method: req.method }))
 server.post("/echo", req => ({ got: req.body }))
@@ -438,7 +448,7 @@ r2 = server.request("POST", "/echo", { name: "Ada" })
 r404 = server.request("GET", "/missing")
 print(r1.status, r1.body.ok, r2.body.got.name, r404.status)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected error: ${out.execution?.error}`);
         assertTrue(
@@ -449,7 +459,7 @@ print(r1.status, r1.body.ok, r2.body.got.name, r404.status)
     },
     {
       name: 'Executes C++ comma for-loops, while, do...while, and OOP constructors (fn init, ClassName, implicit super)',
-      fn: () => {
+      fn: async () => {
         const src = `
 class Base {
   pub x: int
@@ -474,7 +484,7 @@ do {
 } while (k < 3)
 print(d.sum(), total, k)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
         assertTrue(out.execution?.logs[0] === '12 10 3', `Expected '12 10 3', got ${out.execution?.logs[0]}`);
@@ -482,7 +492,7 @@ print(d.sum(), total, k)
     },
     {
       name: 'Executes YourGUI section DOM manipulation and button built-in methods (.innertext, .push, .pop, .disable, .click)',
-      fn: () => {
+      fn: async () => {
         const src = `
 import yourgui from "stdlib/yourgui"
 section("main", () => {
@@ -501,7 +511,7 @@ section("main", () => {
   print(popped, dom("status").innertext, btn.disabled)
 })
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
         assertTrue(
@@ -512,7 +522,7 @@ section("main", () => {
     },
     {
       name: 'Executes C++ pointers (int*, int**, &), swap(int&, int&), new[]/delete[], unique_ptr/shared_ptr/weak_ptr, sizeof, and const pointee safety',
-      fn: () => {
+      fn: async () => {
         const src = `
 x = 10
 y = 20
@@ -537,7 +547,7 @@ wk = weak_ptr(sh)
 locked = wk.lock()
 print(x, y, **pp, s, sizeof(int), u2->val, *locked, wk.expired())
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
         assertTrue(
@@ -551,7 +561,7 @@ print(x, y, **pp, s, sizeof(int), u2->val, *locked, wk.expired())
     },
     {
       name: 'SecurityAnalyzer analyzes imports, style blocks, classes, loops, and branches without false errors',
-      fn: () => {
+      fn: async () => {
         const src = `
 import yourgui from "stdlib/yourgui"
 style { body { color: #f8fafc; } }
@@ -570,7 +580,7 @@ obj = new Item(2)
 print(obj.inc())
 runAll(2)
 `;
-        const out = runEasyJS(src);
+        const out = await runEasyJSAsync(src, { ephemeral: true });
         assertTrue(out.success, `Expected compile success: ${JSON.stringify(out.diagnostics)}`);
         assertTrue(out.security?.analysisComplete === true, 'Expected complete security analysis');
         assertTrue(!out.execution?.error, `Unexpected runtime error: ${out.execution?.error}`);
@@ -582,21 +592,38 @@ runAll(2)
     },
     {
       name: 'SecurityAnalyzer catches ownership violations and sandbox isolates host globals and eval',
-      fn: () => {
+      fn: async () => {
         const dropBorrowed = compileEasyJS(`own a = 1\nref r = &a\ndrop a`);
         assertTrue(!dropBorrowed.success, 'Expected drop-while-borrowed to fail compilation');
 
         const useMoved = compileEasyJS(`own a = 1\nown b = move a\nprint(*a)`);
         assertTrue(!useMoved.success, 'Expected use-after-move to fail compilation');
 
-        const sbGlobals = runEasyJS(`print(window == undefined, document == undefined, process == undefined, require == undefined)`);
+        // Compile-time CapabilitySecurityManager blocks host escape globals & eval by default
+        const blockedCompile = compileEasyJS(`print(window, document, eval("1+1"))`);
+        assertTrue(!blockedCompile.success, 'Expected compile-time capability block for host globals & eval');
+
+        // Runtime sandbox layer independently blocks host globals and eval even if static check is relaxed
+        const relaxedGlobals = {
+          ephemeral: true,
+          securityPolicy: {
+            globals: { forbidHostEscapeGlobals: false, forbidDynamicEval: false },
+          },
+        };
+        const sbGlobals = await runEasyJSAsync(
+          `print(window == undefined, document == undefined, process == undefined, require == undefined)`,
+          relaxedGlobals
+        );
         assertTrue(sbGlobals.success && !sbGlobals.execution?.error, 'Expected sandbox global check to run');
         assertTrue(
           sbGlobals.execution?.logs[0] === 'true true true true',
           `Expected host globals to be blocked, got ${sbGlobals.execution?.logs[0]}`
         );
 
-        const sbEval = runEasyJS(`try {\n  eval("1 + 1")\n} catch e {\n  print(e.message)\n}`);
+        const sbEval = await runEasyJSAsync(
+          `try {\n  eval("1 + 1")\n} catch e {\n  print(e.message)\n}`,
+          relaxedGlobals
+        );
         assertTrue(sbEval.success && !sbEval.execution?.error, 'Expected sandbox eval catch to run');
         assertTrue(
           Boolean(sbEval.execution?.logs[0]?.includes('SecurityError')),
@@ -604,19 +631,281 @@ runAll(2)
         );
       },
     },
+    {
+      name: 'NetworkPolicyManager bounds fetch() against cookies, credentials, SSRF, and unsafe methods',
+      fn: async () => {
+        const cookieCreds = compileEasyJS(`fetch("https://example.com/api", { credentials: "include" })`);
+        assertTrue(!cookieCreds.success, 'Expected fetch credentials: include to be blocked');
+
+        const cookieHeader = compileEasyJS(`fetch("https://example.com/api", { headers: { Cookie: "sid=123" } })`);
+        assertTrue(!cookieHeader.success, 'Expected Cookie header in fetch to be blocked');
+
+        const ssrfLocal = compileEasyJS(`fetch("http://127.0.0.1:8080/secret")`);
+        assertTrue(!ssrfLocal.success, 'Expected loopback SSRF fetch to be blocked');
+
+        const ssrfMeta = compileEasyJS(`fetch("http://169.254.169.254/latest/meta-data/")`);
+        assertTrue(!ssrfMeta.success, 'Expected cloud metadata SSRF fetch to be blocked');
+
+        const unsafePost = compileEasyJS(`fetch("https://example.com/exfil", { method: "POST", body: "x" })`);
+        assertTrue(!unsafePost.success, 'Expected POST fetch to be blocked under default read-only policy');
+
+        const safeGet = compileEasyJS(`fn load() {\n  return fetch("https://api.example.com/info")\n}`);
+        assertTrue(safeGet.success, `Expected safe public GET fetch to compile: ${JSON.stringify(safeGet.diagnostics)}`);
+      },
+    },
+    {
+      name: 'GlobalAccessPolicy controls globalThis (disabled by default, readonly/sandboxed via policy)',
+      fn: async () => {
+        const disabledCompile = compileEasyJS(`print(globalThis)`);
+        assertTrue(!disabledCompile.success, 'Expected globalThis to be blocked when globalThisMode is disabled');
+
+        const disabledRuntime = await runEasyJSAsync(
+          `try {\n  x = globalThis.Math\n  print("leaked")\n} catch e {\n  print(e.message)\n}`,
+          { ephemeral: true, securityPolicy: { globals: { globalThisMode: 'sandboxed' } } }
+        );
+        assertTrue(disabledRuntime.success, 'Sandboxed globalThisMode allows safe globalThis');
+
+        const readonlyMutate = compileEasyJS(`globalThis.hack = 1`, {
+          securityPolicy: { globals: { globalThisMode: 'readonly' } },
+        });
+        assertTrue(!readonlyMutate.success, 'Expected mutating globalThis to fail in readonly mode');
+
+        const readonlyRead = compileEasyJS(`print(globalThis.Math)`, {
+          securityPolicy: { globals: { globalThisMode: 'readonly' } },
+        });
+        assertTrue(readonlyRead.success, 'Expected reading globalThis to pass in readonly mode');
+      },
+    },
+    {
+      name: 'BorrowChecker prevents dangling references, immutable-borrow writes, and mutable aliasing',
+      fn: async () => {
+        const danglingRet = compileEasyJS(`fn leak() {\n  own x = 42\n  return &x\n}`);
+        assertTrue(!danglingRet.success, 'Expected returning &local owner to fail borrow lifetime check');
+
+        const writeThroughShared = compileEasyJS(`own x = 10\nref r = &x\n*r = 20`);
+        assertTrue(!writeThroughShared.success, 'Expected mutating through shared ref to be rejected');
+
+        const mutAlias = compileEasyJS(`own x = 10\nref r = &x\nint& m = x`);
+        assertTrue(!mutAlias.success, 'Expected mutable borrow while shared borrow exists to be rejected');
+      },
+    },
+    {
+      name: 'TypeChecker validates recursive functions, arity/arg types, control-flow returns, structs, and null safety',
+      fn: async () => {
+        const recursiveOk = await runEasyJSAsync(`
+fn fib(n: int) -> int {
+  if n <= 1:
+    return n
+  else:
+    return fib(n - 1) + fib(n - 2)
+}
+print(fib(6))
+`, { ephemeral: true });
+        assertTrue(recursiveOk.success, `Expected recursive function to compile: ${JSON.stringify(recursiveOk.diagnostics)}`);
+        assertTrue(recursiveOk.execution?.logs[0] === '8', `Expected fib(6)=8, got ${recursiveOk.execution?.logs[0]}`);
+
+        const badArity = compileEasyJS(`fn add(a: int, b: int) -> int { return a + b }\nprint(add(1))`);
+        assertTrue(!badArity.success, 'Expected wrong argument count to fail type check');
+
+        const badArgType = compileEasyJS(`fn greet(name: str) -> str { return name }\nprint(greet(123))`);
+        assertTrue(!badArgType.success, 'Expected wrong argument type to fail type check');
+
+        const missingReturnPath = compileEasyJS(`fn check(ok: bool) -> int {\n  if ok:\n    return 1\n}`);
+        assertTrue(!missingReturnPath.success, 'Expected missing return branch to fail control-flow check');
+
+        const nullUnsafe = compileEasyJS(`var s: str? = null\nvar strict: str = s`);
+        assertTrue(!nullUnsafe.success, 'Expected assigning nullable str? to non-null str to fail');
+
+        const nullNarrowedOk = compileEasyJS(`
+fn unwrap(s: str?) -> str {
+  if s != null {
+    var safe: str = s
+    return safe
+  }
+  return "default"
+}
+`);
+        assertTrue(nullNarrowedOk.success, `Expected narrowed nullable type to pass: ${JSON.stringify(nullNarrowedOk.diagnostics)}`);
+      },
+    },
+    {
+      name: 'SecurityAnalyzer and CapabilitySecurityManager fail closed on incomplete analysis or unknown AST nodes',
+      fn: async () => {
+        const analyzer = new SecurityAnalyzer();
+        const forgedAst = {
+          kind: 'Program' as const,
+          line: 1,
+          column: 1,
+          body: [
+            {
+              kind: 'UnknownMaliciousStatement' as never,
+              line: 1,
+              column: 1,
+            } as never,
+          ],
+        };
+        const res = analyzer.analyze(forgedAst);
+        assertTrue(!res.analysisComplete, 'Expected analysisComplete to become false on unknown AST statement');
+        assertTrue(!res.success, 'Expected SecurityAnalyzer to fail closed on unknown AST statement');
+        assertTrue(
+          res.diagnostics.some((d) => d.code === 'SEC000'),
+          'Expected SEC000 diagnostic when security analysis is incomplete'
+        );
+
+        const capMgr = new CapabilitySecurityManager();
+        const capRes = capMgr.analyze(forgedAst);
+        assertTrue(!capRes.analysisComplete, 'Expected CapabilitySecurityManager analysisComplete=false on unknown AST node');
+        assertTrue(!capRes.success, 'Expected CapabilitySecurityManager to reject unknown AST node');
+
+        // Deeply nested AST (>200 levels) must fail closed rather than silently skipping checks
+        let deepExpr: Record<string, unknown> = { kind: 'Literal', value: 1, raw: '1', literalType: 'number', line: 1, column: 1 };
+        for (let i = 0; i < 230; i++) {
+          deepExpr = {
+            kind: 'UnaryExpression',
+            operator: '-',
+            operand: deepExpr,
+            line: 1,
+            column: 1,
+          };
+        }
+        const deepAst = {
+          kind: 'Program' as const,
+          line: 1,
+          column: 1,
+          body: [{ kind: 'ExpressionStatement', expression: deepExpr, line: 1, column: 1 } as never],
+        };
+        const deepRes = new SecurityAnalyzer().analyze(deepAst);
+        assertTrue(!deepRes.analysisComplete, 'Expected SecurityAnalyzer to fail closed when depth budget is exceeded');
+        assertTrue(!deepRes.success, 'Expected SecurityAnalyzer to block oversized AST depth');
+      },
+    },
+    {
+      name: 'CapabilitySecurityManager blocks meta-programming escapes, timer string-eval, and computed constructor gadgets',
+      fn: async () => {
+        const attacks = [
+          `p = new Proxy({}, {})`,
+          `r = Reflect.get({}, "a")`,
+          `w = WebAssembly`,
+          `Object.defineProperty({}, "x", { value: 1 })`,
+          `Object.setPrototypeOf({}, {})`,
+          `setTimeout("process.exit(1)", 0)`,
+          `k = "constructor"\nx = ({})[k]`,
+          `x = ({})["con" + "structor"]`,
+          `print(__ejs_Proxy)`,
+          `var bad: int = "str"\nprint(eval("1+1"))`,
+        ];
+
+        for (const attack of attacks) {
+          const compiled = compileEasyJS(attack);
+          assertTrue(!compiled.success, `Expected attack to be blocked at compile time: ${attack}`);
+          assertTrue(compiled.code === '', `Expected zero emitted JS code for blocked attack: ${attack}`);
+          assertTrue(
+            compiled.securityVerdict.approved === false,
+            `Expected securityVerdict.approved=false for attack: ${attack}`
+          );
+        }
+
+        // Security errors must never be masked even when TypeChecker also finds an error
+        const mixed = compileEasyJS(`var bad: int = "str"\nprint(eval("1+1"))`);
+        assertTrue(
+          mixed.diagnostics.some((d) => Boolean(d.title?.startsWith('Security '))),
+          'Expected Security diagnostic to still be reported alongside type errors'
+        );
+      },
+    },
+    {
+      name: 'VM sandbox blocks cross-realm constructor escapes, prototype pollution, and string timers at runtime',
+      fn: async () => {
+        const relaxedStatic = {
+          ephemeral: true,
+          securityPolicy: {
+            globals: {
+              forbidHostEscapeGlobals: false,
+              forbidDynamicEval: false,
+              forbidPrototypeAccess: false,
+            },
+          },
+        };
+
+        const ctorEscape = await runEasyJSAsync(
+          `try {\n  fnLeak = print["constructor"]("return process")()\n  print("ESCAPED", fnLeak)\n} catch e {\n  print("BLOCKED:" + e.message)\n}`,
+          relaxedStatic
+        );
+        assertTrue(
+          Boolean(ctorEscape.execution?.logs[0]?.startsWith('BLOCKED:')),
+          `Expected print["constructor"] escape to be blocked, got ${JSON.stringify(ctorEscape.execution)}`
+        );
+
+        const protoPollute = await runEasyJSAsync(
+          `try {\n  ({}).__proto__.pwned = 123\n  print("POLLUTED:" + ({}).pwned)\n} catch e {\n  print("PROTO_BLOCKED:" + e.message)\n}`,
+          relaxedStatic
+        );
+        const protoOut = protoPollute.execution?.logs[0] ?? '';
+        assertTrue(
+          protoOut.startsWith('PROTO_BLOCKED:') || protoOut === 'POLLUTED:undefined' || Boolean(protoPollute.execution?.error),
+          `Expected prototype pollution to fail inside VM sandbox, got ${JSON.stringify(protoPollute.execution)}`
+        );
+
+        const stringTimer = await runEasyJSAsync(
+          `try {\n  setTimeout("console.log(1)", 0)\n  print("ALLOWED")\n} catch e {\n  print("TIMER_BLOCKED:" + e.message)\n}`,
+          relaxedStatic
+        );
+        assertTrue(
+          Boolean(stringTimer.execution?.logs[0]?.startsWith('TIMER_BLOCKED:')),
+          `Expected setTimeout string evaluation to be blocked, got ${JSON.stringify(stringTimer.execution)}`
+        );
+      },
+    },
+    {
+      name: 'SandboxBuilderEngine builds CSP-hardened lexical isolation without new Function() or with()',
+      fn: () => {
+        const compiled = compileEasyJS(`print("</script><!-- safe -->")`);
+        assertTrue(compiled.success, 'Expected script-tag escape test snippet to compile');
+
+        const lexicalUnit = buildLexicallyIsolatedInvocation({
+          code: compiled.code,
+          globalThisMode: 'disabled',
+          asyncExecution: true,
+        });
+        assertTrue(!lexicalUnit.includes('new Function'), 'Must not contain new Function()');
+        assertTrue(!lexicalUnit.includes('with ('), 'Must not use with(...) proxy scopes');
+        assertTrue(lexicalUnit.includes('window, document'), 'Must lexically shadow host globals');
+
+        const policy = new SecurityPolicyManager().policy;
+        const html = buildBrowserSandboxDocument({
+          code: compiled.code,
+          token: 'test_tok',
+          policy,
+          stdin: ['</script>'],
+        });
+        assertTrue(!html.includes("'unsafe-eval'"), 'CSP must omit unsafe-eval');
+        assertTrue(
+          html.includes("script-src 'unsafe-inline'"),
+          'CSP must permit pre-built inline script execution only'
+        );
+        assertTrue(!html.includes('__iframeCompile'), 'Must not contain iframe Function compiler');
+        assertTrue(!html.includes('</script><!--'), 'Compiled </script> string must be escaped cleanly');
+        assertTrue(
+          SandboxBuilderEngine.escapeScriptTag('</script><!--') === '<\\/script><\\!--',
+          'SandboxBuilderEngine.escapeScriptTag must neutralize closing tags'
+        );
+      },
+    },
   ];
 
-  return tests.map((t) => {
+  const results: TestCaseResult[] = [];
+  for (const t of tests) {
     try {
-      t.fn();
-      return { suite: 'Generator & Runtime', name: t.name, passed: true };
+      await t.fn();
+      results.push({ suite: 'Generator & Runtime', name: t.name, passed: true });
     } catch (err) {
-      return {
+      results.push({
         suite: 'Generator & Runtime',
         name: t.name,
         passed: false,
         error: err instanceof Error ? err.message : String(err),
-      };
+      });
     }
-  });
+  }
+  return results;
 }

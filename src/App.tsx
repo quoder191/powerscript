@@ -14,6 +14,7 @@ import {
   type RunResult,
   type VisualOutputItem,
 } from './compiler/index.ts';
+import { runEasyJSServerSandbox } from './compiler/sandboxClient.ts';
 import { Console, type TerminalEntry } from './components/Console.tsx';
 import { Editor } from './components/Editor.tsx';
 import { FileExplorer } from './components/FileExplorer.tsx';
@@ -475,12 +476,13 @@ print(*secretKey)
   },
 ];
 
-function executeAllTests(): TestCaseResult[] {
+async function executeAllTests(): Promise<TestCaseResult[]> {
+  const genResults = await runGeneratorTests();
   return [
     ...runLexerTests(),
     ...runParserTests(),
     ...runTransformerTests(),
-    ...runGeneratorTests(),
+    ...genResults,
   ];
 }
 
@@ -540,7 +542,7 @@ export default function App() {
   const [saveDialogName, setSaveDialogName] = useState('my-app.ejs');
 
   const [selectedPresetId, setSelectedPresetId] = useState<string>(PRESETS[0].id);
-  const [engine, setEngine] = useState<ExecutionEngine>('interpreter');
+  const [engine, setEngine] = useState<ExecutionEngine>('server-sandbox');
   const [source, setSource] = useState<string>(
     initialActiveFile ? initialActiveFile.content : PRESETS[0].code
   );
@@ -601,9 +603,9 @@ export default function App() {
   // Run initial program and defer unit test suite so UI mounts cleanly
   useEffect(() => {
     const initialCode = initialActiveFile ? initialActiveFile.content : PRESETS[0].code;
-    void executeProgram(initialCode, 'interpreter');
+    void executeProgram(initialCode, 'server-sandbox');
     const timer = window.setTimeout(() => {
-      setTestResults(executeAllTests());
+      void executeAllTests().then((results) => setTestResults(results));
     }, 80);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -778,9 +780,11 @@ export default function App() {
 
     const ioOpts = buildIoOptions(seq, controller.signal);
     const result =
-      selectedEngine === 'interpreter'
-        ? await runEasyJSInterpreted(codeToRun, ioOpts)
-        : await runEasyJSAsync(codeToRun, ioOpts);
+      selectedEngine === 'server-sandbox'
+        ? await runEasyJSServerSandbox(codeToRun, ioOpts)
+        : selectedEngine === 'interpreter'
+          ? await runEasyJSInterpreted(codeToRun, ioOpts)
+          : await runEasyJSAsync(codeToRun, ioOpts);
 
     if (runSeqRef.current === seq) {
       if (activeRunAbortRef.current === controller) {
@@ -969,8 +973,8 @@ export default function App() {
   };
 
   const handleRunTests = () => {
-    setTestResults(executeAllTests());
     setActiveView('tests');
+    void executeAllTests().then((results) => setTestResults(results));
   };
 
   const handleGuiEvent = (
@@ -1040,7 +1044,7 @@ export default function App() {
       return;
     }
     if (cmd === 'test' || cmd === 'tests') {
-      const results = executeAllTests();
+      const results = await executeAllTests();
       setTestResults(results);
       const passed = results.filter((r) => r.passed).length;
       appendTerminal('out', `Tests: ${passed}/${results.length} passed.`);
@@ -1299,7 +1303,7 @@ export default function App() {
               setFocusedLine(line);
               setShowCode(true);
             }}
-            onRunTests={() => setTestResults(executeAllTests())}
+            onRunTests={() => void executeAllTests().then((results) => setTestResults(results))}
             isHidden={consoleHidden}
             onToggleHidden={() => setConsoleHidden((h) => !h)}
             terminalEntries={terminalEntries}
@@ -1336,7 +1340,7 @@ export default function App() {
               </div>
               <button
                 type="button"
-                onClick={() => setTestResults(executeAllTests())}
+                onClick={() => void executeAllTests().then((results) => setTestResults(results))}
                 className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md cursor-pointer whitespace-nowrap shrink-0"
               >
                 Run All Tests

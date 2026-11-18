@@ -7,10 +7,12 @@ import { YOURGUI_STDLIB_SOURCE } from './yourgui/index.ts';
 
 export function buildRuntimePrelude(): string {
   return `// EasyJS Modular Standard Library Prelude (Core · Browser · System · Stack)
+const __ejs_host_fetch = typeof __ejs_fetch === "function" ? __ejs_fetch : null;
+const __ejs_host_Proxy = typeof __ejs_Proxy === "function" ? __ejs_Proxy : (typeof Proxy === "function" ? Proxy : null);
 const __ejs = (() => {
   const pointerEvents = [];
-  const stdinQueue = Array.isArray(globalThis.__ejs_stdin) ? [...globalThis.__ejs_stdin] : [];
-  const ioHandler = typeof globalThis.__ejs_io === "object" && globalThis.__ejs_io ? globalThis.__ejs_io : null;
+  const stdinQueue = typeof __ejs_stdin !== "undefined" && Array.isArray(__ejs_stdin) ? [...__ejs_stdin] : [];
+  const ioHandler = typeof __ejs_io !== "undefined" && typeof __ejs_io === "object" && __ejs_io ? __ejs_io : null;
 
   const formatVal = (v) => {
     if (v === null || v === undefined) return "null";
@@ -83,12 +85,13 @@ const __ejs = (() => {
     toString() { return \`Queue[\${this._items.map(formatVal).join(", ")}]\`; }
   }
 
-  const makeConstructible = (Cls) =>
-    new Proxy(Cls, {
-      apply(target, _thisArg, args) {
-        return new target(...args);
-      },
-    });
+  const makeConstructible = (Cls) => {
+    function Constructible(...args) {
+      return new Cls(...args);
+    }
+    Constructible.prototype = Cls.prototype;
+    return Constructible;
+  };
 
   const StackCtor = makeConstructible(Stack);
   const QueueCtor = makeConstructible(Queue);
@@ -529,7 +532,7 @@ ${MODULES_STDLIB_SOURCE}
       };
 
       const browserLocation = () => {
-        const loc = typeof globalThis !== "undefined" && globalThis.location ? globalThis.location : null;
+        const loc = typeof location !== "undefined" && location ? location : null;
         return {
           href: loc ? String(loc.href || "about:blank") : "about:blank",
           pathname: loc ? String(loc.pathname || "/") : "/",
@@ -542,7 +545,8 @@ ${MODULES_STDLIB_SOURCE}
       };
 
       const wrapPtrProxy = (cell) => {
-        const proxy = new Proxy(cell, {
+        if (!__ejs_host_Proxy) return cell;
+        const proxy = new __ejs_host_Proxy(cell, {
           get(target, prop) {
             if (prop === Symbol.toPrimitive) return () => target.addr || formatVal(proxy);
             if (prop === "__rawCell") return target;

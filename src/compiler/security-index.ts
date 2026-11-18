@@ -1,4 +1,3 @@
-
 /**
  * PowerScript Security Engine
  * Public API Entry Point
@@ -10,6 +9,7 @@
 
 export {
     OwnerState,
+    OwnerKind,
     BorrowKind,
     DiagnosticSeverity,
     DEFAULT_SECURITY_POLICY
@@ -51,12 +51,34 @@ export {
 } from "./borrow-checker";
 
 // ==========================================
-// 5. Security Engine
+// 5. Security Engine & Managers
 // ==========================================
 
 export {
     PowerScriptSecurityEngine
 } from "./security-engine";
+
+export {
+    SecurityPolicyManager,
+    NetworkPolicyManager,
+    DEFAULT_COMPILER_SECURITY_POLICY,
+    DEFAULT_NETWORK_SECURITY_POLICY,
+    DEFAULT_GLOBAL_ACCESS_POLICY,
+    DEFAULT_TYPE_SAFETY_POLICY,
+    DEFAULT_BLOCKED_HEADERS,
+    type GlobalThisPolicyMode,
+    type NetworkSecurityPolicy,
+    type GlobalAccessPolicy,
+    type TypeSafetyPolicy,
+    type CompilerSecurityPolicy,
+    type PartialCompilerSecurityPolicy,
+    type FetchValidationResult
+} from "./security-policy";
+
+export {
+    CapabilitySecurityManager,
+    type CapabilitySecurityResult
+} from "./capability-security";
 
 // ==========================================
 // 6. Default Export

@@ -1,4 +1,3 @@
-
 /**
  * PowerScript Security Engine
  * Ownership Management System
@@ -6,6 +5,7 @@
 
 import {
     OwnerState,
+    OwnerKind,
     OwnerRecord,
     BorrowRecord,
     BorrowKind,
@@ -33,7 +33,9 @@ export class OwnershipModel {
         id: string,
         name: string,
         scopeId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        scopeDepth = 0,
+        kind: OwnerKind = OwnerKind.UNIQUE
     ): void {
 
         if (this.owners.has(id)) {
@@ -49,7 +51,10 @@ export class OwnershipModel {
             id,
             name,
             state: OwnerState.ACTIVE,
+            kind,
             scopeId,
+            scopeDepth,
+            refCount: 1,
             createdAt: location
         });
     }
@@ -60,6 +65,10 @@ export class OwnershipModel {
 
     getOwner(id: string): OwnerRecord | undefined {
         return this.owners.get(id);
+    }
+
+    getBorrow(id: string): BorrowRecord | undefined {
+        return this.borrows.get(id);
     }
 
     // ======================================
@@ -117,18 +126,14 @@ export class OwnershipModel {
     // 4. Check active borrows
     // ======================================
 
+    getActiveBorrows(ownerId: string): BorrowRecord[] {
+        return [...this.borrows.values()].filter(
+            borrow => borrow.ownerId === ownerId && borrow.active
+        );
+    }
+
     hasActiveBorrows(ownerId: string): boolean {
-
-        for (const borrow of this.borrows.values()) {
-            if (
-                borrow.ownerId === ownerId &&
-                borrow.active
-            ) {
-                return true;
-            }
-        }
-
-        return false;
+        return this.getActiveBorrows(ownerId).length > 0;
     }
 
     // ======================================
@@ -139,7 +144,9 @@ export class OwnershipModel {
         id: string,
         newId: string,
         newName: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        targetScopeId?: string,
+        targetScopeDepth?: number
     ): void {
 
         const owner = this.owners.get(id);
@@ -161,7 +168,8 @@ export class OwnershipModel {
             this.diagnostics.error(
                 "OWN007",
                 `Cannot move '${owner.name}' while it is borrowed.`,
-                location
+                location,
+                "End all active references/borrows before transferring ownership."
             );
             return;
         }
@@ -173,9 +181,51 @@ export class OwnershipModel {
             id: newId,
             name: newName,
             state: OwnerState.ACTIVE,
-            scopeId: owner.scopeId,
+            kind: owner.kind,
+            scopeId: targetScopeId ?? owner.scopeId,
+            scopeDepth: targetScopeDepth ?? owner.scopeDepth,
+            refCount: owner.refCount,
             createdAt: location
         });
+    }
+
+    // ======================================
+    // 5b. Clone shared ownership handle
+    // ======================================
+
+    cloneSharedOwner(
+        id: string,
+        newId: string,
+        newName: string,
+        scopeId: string,
+        scopeDepth: number,
+        location?: SourceLocation
+    ): boolean {
+        const owner = this.owners.get(id);
+        if (!owner || !this.isUsable(id, location)) {
+            return false;
+        }
+        if (owner.kind !== OwnerKind.SHARED) {
+            this.diagnostics.error(
+                "OWN016",
+                `Cannot clone non-shared owner '${owner.name}'.`,
+                location,
+                "Use `move` for unique ownership or declare with `shared` / `make_shared`."
+            );
+            return false;
+        }
+        owner.refCount += 1;
+        this.owners.set(newId, {
+            id: newId,
+            name: newName,
+            state: OwnerState.ACTIVE,
+            kind: OwnerKind.SHARED,
+            scopeId,
+            scopeDepth,
+            refCount: owner.refCount,
+            createdAt: location
+        });
+        return true;
     }
 
     // ======================================
@@ -187,7 +237,8 @@ export class OwnershipModel {
         borrowId: string,
         kind: BorrowKind,
         scopeId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        scopeDepth = 0
     ): boolean {
 
         const owner = this.owners.get(ownerId);
@@ -205,17 +256,14 @@ export class OwnershipModel {
             return false;
         }
 
-        const activeBorrows = [...this.borrows.values()].filter(
-            borrow =>
-                borrow.ownerId === ownerId &&
-                borrow.active
-        );
+        const activeBorrows = this.getActiveBorrows(ownerId);
 
         if (kind === BorrowKind.MUTABLE && activeBorrows.length > 0) {
             this.diagnostics.error(
                 "OWN009",
                 `Cannot create mutable borrow of '${owner.name}' while another borrow exists.`,
-                location
+                location,
+                "Mutable borrows require exclusive access; end existing borrows first."
             );
             return false;
         }
@@ -229,7 +277,8 @@ export class OwnershipModel {
             this.diagnostics.error(
                 "OWN010",
                 `Cannot create shared borrow of '${owner.name}' while a mutable borrow exists.`,
-                location
+                location,
+                "Wait for the mutable borrow to end before taking a shared reference."
             );
             return false;
         }
@@ -239,6 +288,7 @@ export class OwnershipModel {
             ownerId,
             kind,
             scopeId,
+            scopeDepth,
             active: true,
             createdAt: location
         });
@@ -298,7 +348,8 @@ export class OwnershipModel {
             this.diagnostics.error(
                 "OWN013",
                 `Cannot drop '${owner.name}' while it is borrowed.`,
-                location
+                location,
+                "Ensure all borrows referencing this owner end before dropping it."
             );
             return;
         }
@@ -336,7 +387,6 @@ export class OwnershipModel {
                         borrow.createdAt
                     );
                 } else {
-                    // Lexical RAII: end borrows belonging to the exiting scope
                     borrow.active = false;
                 }
             }
@@ -356,7 +406,6 @@ export class OwnershipModel {
                         "Consider explicitly dropping or transferring ownership."
                     );
                 } else {
-                    // Lexical RAII: release owner at scope exit
                     owner.state = OwnerState.DROPPED;
                 }
             }
@@ -364,23 +413,19 @@ export class OwnershipModel {
     }
 
     // ======================================
-    // 10. Get all owners
+    // 10. Get all owners & borrows
     // ======================================
 
     getAllOwners(): OwnerRecord[] {
         return [...this.owners.values()];
     }
 
-    // ======================================
-    // 11. Get all borrows
-    // ======================================
-
     getAllBorrows(): BorrowRecord[] {
         return [...this.borrows.values()];
     }
 
     // ======================================
-    // 12. Snapshot & restore ownership state
+    // 11. Snapshot & restore ownership state
     // ======================================
 
     snapshot(): {
@@ -411,10 +456,6 @@ export class OwnershipModel {
             this.borrows.set(k, { ...v });
         }
     }
-
-    // ======================================
-    // 13. Reset ownership state
-    // ======================================
 
     clear(): void {
         this.owners.clear();

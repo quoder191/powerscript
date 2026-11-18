@@ -90,7 +90,8 @@ export const YOURGUI_DOM_SOURCE = `
       let domEl = useNativeDom ? document.createElement(tag) : null;
       if (domEl && textContent) domEl.textContent = textContent;
 
-      const styleProxy = new Proxy(styleObj, {
+      const __GuiProxy = typeof __ejs_host_Proxy === "function" ? __ejs_host_Proxy : (typeof Proxy === "function" ? Proxy : null);
+      const styleProxy = __GuiProxy ? new __GuiProxy(styleObj, {
         set(target, prop, val) {
           const key = String(prop);
           target[key] = val === null || val === undefined ? "" : String(val);
@@ -101,7 +102,7 @@ export const YOURGUI_DOM_SOURCE = `
         get(target, prop) {
           return target[String(prop)];
         },
-      });
+      }) : styleObj;
 
       const getClasses = () => String(attrs.class ?? "").split(/\\s+/).filter(Boolean);
 

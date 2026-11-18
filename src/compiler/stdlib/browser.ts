@@ -129,14 +129,41 @@ export const BROWSER_STDLIB_SOURCE = `
     const raw = String(url ?? "");
     let parsed;
     try {
-      parsed = new URL(raw, "https://sandbox.invalid");
+      parsed = new URL(raw);
     } catch {
-      throw new Error("SecurityError: Invalid URL '" + raw + "'");
+      throw new Error("SecurityError: Invalid fetch URL '" + raw + "'");
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error("SecurityError: Blocked fetch protocol '" + parsed.protocol + "' in sandbox");
     }
-    const res = await globalThis.fetch(parsed.toString(), options);
+    if (parsed.username || parsed.password) {
+      throw new Error("SecurityError: Embedded URL credentials are blocked in fetch()");
+    }
+    const opts = options && typeof options === "object" ? options : {};
+    if (typeof opts.credentials === "string" && opts.credentials.toLowerCase() !== "omit") {
+      throw new Error("SecurityError: fetch() credentials and cookies are blocked by security policy");
+    }
+    if (opts.headers && typeof opts.headers === "object") {
+      const entries = typeof opts.headers.entries === "function"
+        ? Array.from(opts.headers.entries())
+        : Object.entries(opts.headers);
+      for (const pair of entries) {
+        const key = String(pair[0] || "").toLowerCase();
+        if (key === "cookie" || key === "cookie2" || key === "set-cookie" || key === "authorization") {
+          throw new Error("SecurityError: Header '" + pair[0] + "' is blocked by security policy");
+        }
+      }
+    }
+    const fetchFn = typeof __ejs_host_fetch === "function" ? __ejs_host_fetch : null;
+    if (!fetchFn) {
+      throw new Error("SecurityError: fetch() is unavailable in this sandbox");
+    }
+    const res = await fetchFn(parsed.toString(), {
+      ...opts,
+      credentials: "omit",
+      redirect: "error",
+      referrerPolicy: "no-referrer"
+    });
     const contentType = res.headers?.get?.("content-type") || "";
     if (contentType.includes("application/json")) {
       return await res.json();

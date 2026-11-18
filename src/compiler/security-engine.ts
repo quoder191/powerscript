@@ -1,4 +1,3 @@
-
 /**
  * PowerScript Security Engine
  * Central Security Controller
@@ -9,6 +8,7 @@ import {
     SecurityAnalysisResult,
     SourceLocation,
     BorrowKind,
+    OwnerKind,
     DEFAULT_SECURITY_POLICY
 } from "./types";
 
@@ -48,14 +48,18 @@ export class PowerScriptSecurityEngine {
         id: string,
         name: string,
         scopeId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        scopeDepth = 0,
+        kind: OwnerKind = OwnerKind.UNIQUE
     ): void {
 
         this.ownership.createOwner(
             id,
             name,
             scopeId,
-            location
+            location,
+            scopeDepth,
+            kind
         );
     }
 
@@ -76,14 +80,13 @@ export class PowerScriptSecurityEngine {
         id: string,
         newId: string,
         newName: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        targetScopeId?: string,
+        targetScopeDepth?: number
     ): void {
 
         if (!this.policy.forbidMoveWhileBorrowed &&
             this.ownership.hasActiveBorrows(id)) {
-            // Policy permits the operation.
-            // OwnershipModel currently rejects it, so this
-            // configuration is not supported by this operation.
             this.diagnostics.warning(
                 "SEC001",
                 "Move-while-borrowed policy is disabled, but the ownership model still enforces this restriction.",
@@ -96,6 +99,27 @@ export class PowerScriptSecurityEngine {
             id,
             newId,
             newName,
+            location,
+            targetScopeId,
+            targetScopeDepth
+        );
+    }
+
+    // Clone a shared owner
+    cloneShared(
+        id: string,
+        newId: string,
+        newName: string,
+        scopeId: string,
+        scopeDepth: number,
+        location?: SourceLocation
+    ): boolean {
+        return this.ownership.cloneSharedOwner(
+            id,
+            newId,
+            newName,
+            scopeId,
+            scopeDepth,
             location
         );
     }
@@ -105,7 +129,8 @@ export class PowerScriptSecurityEngine {
         ownerId: string,
         borrowId: string,
         scopeId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        scopeDepth = 0
     ): boolean {
 
         if (!this.borrowChecker.checkSharedBorrow(ownerId, location)) {
@@ -117,7 +142,8 @@ export class PowerScriptSecurityEngine {
             borrowId,
             BorrowKind.SHARED,
             scopeId,
-            location
+            location,
+            scopeDepth
         );
     }
 
@@ -126,7 +152,8 @@ export class PowerScriptSecurityEngine {
         ownerId: string,
         borrowId: string,
         scopeId: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        scopeDepth = 0
     ): boolean {
 
         if (!this.borrowChecker.checkMutableBorrow(ownerId, location)) {
@@ -138,7 +165,8 @@ export class PowerScriptSecurityEngine {
             borrowId,
             BorrowKind.MUTABLE,
             scopeId,
-            location
+            location,
+            scopeDepth
         );
     }
 
@@ -179,12 +207,14 @@ export class PowerScriptSecurityEngine {
     // Check direct owner mutation
     checkMutation(
         id: string,
-        location?: SourceLocation
+        location?: SourceLocation,
+        allowInteriorUnderShared = false
     ): boolean {
 
         return this.borrowChecker.checkOwnerMutation(
             id,
-            location
+            location,
+            allowInteriorUnderShared
         );
     }
 
@@ -196,6 +226,40 @@ export class PowerScriptSecurityEngine {
 
         return this.borrowChecker.checkOwnerRead(
             id,
+            location
+        );
+    }
+
+    // Check borrow read
+    checkBorrowRead(
+        borrowId: string,
+        location?: SourceLocation
+    ): boolean {
+        return this.borrowChecker.checkBorrowUsage(borrowId, location);
+    }
+
+    // Check borrow write (requires mutable borrow)
+    checkBorrowWrite(
+        borrowId: string,
+        location?: SourceLocation
+    ): boolean {
+        return this.borrowChecker.checkMutableBorrowAccess(borrowId, location);
+    }
+
+    // Check lifetime escape (dangling reference prevention)
+    checkLifetimeEscape(
+        ownerId: string,
+        targetScopeDepth: number,
+        contextDescription: string,
+        location?: SourceLocation
+    ): boolean {
+        if (!this.policy.forbidDanglingReferences) {
+            return true;
+        }
+        return this.borrowChecker.checkLifetimeEscape(
+            ownerId,
+            targetScopeDepth,
+            contextDescription,
             location
         );
     }
@@ -241,4 +305,3 @@ export class PowerScriptSecurityEngine {
         this.ownership.clear();
     }
 }
-      

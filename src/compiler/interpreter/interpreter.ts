@@ -18,6 +18,11 @@ import {
   VisualOutputItem,
 } from '../utils/helpers.ts';
 import { YourGuiEngine } from '../stdlib/yourgui/index.ts';
+import {
+  NetworkPolicyManager,
+  SecurityPolicyManager,
+  type CompilerSecurityPolicy,
+} from '../security-policy.ts';
 
 class ReturnSignal {
   public readonly value: unknown;
@@ -36,6 +41,56 @@ class ExitSignal extends Error {
     this.name = 'ExitSignal';
   }
 }
+
+const MAX_INTERPRETER_OPS = 500_000;
+const MAX_INTERPRETER_MS = 8_000;
+const MAX_CALL_DEPTH = 256;
+
+const INTERPRETER_ESCAPE_GLOBALS = new Set([
+  'window',
+  'document',
+  'self',
+  'top',
+  'parent',
+  'frames',
+  'opener',
+  'navigator',
+  'history',
+  'cookieStore',
+  'indexedDB',
+  'XMLHttpRequest',
+  'WebSocket',
+  'Worker',
+  'SharedWorker',
+  'ServiceWorker',
+  'EventSource',
+  'BroadcastChannel',
+  'MessageChannel',
+  'MessagePort',
+  'importScripts',
+  'process',
+  'require',
+  'module',
+  'exports',
+  'global',
+  'Buffer',
+  'Deno',
+  'Bun',
+  'Proxy',
+  'Reflect',
+  'WebAssembly',
+  'SharedArrayBuffer',
+  'Atomics',
+  'WeakRef',
+  'FinalizationRegistry',
+  'AsyncFunction',
+  'GeneratorFunction',
+  'AsyncGeneratorFunction',
+  'ActiveXObject',
+  'WScript',
+]);
+
+const INTERPRETER_EVAL_GLOBALS = new Set(['eval', 'Function']);
 
 interface EnvBinding {
   value: unknown;
@@ -334,6 +389,9 @@ export class ASTInterpreter {
   private readonly activeIntervals = new Set<ReturnType<typeof setInterval>>();
   private readonly stdinQueue: string[];
   private readonly options: InterpreterOptions;
+  private readonly securityPolicy: CompilerSecurityPolicy;
+  private readonly networkManager: NetworkPolicyManager;
+  private sandboxGlobalThis: Record<string, unknown> | null = null;
 
   private globalEnv: Environment;
   private activeEnv: Environment;
@@ -341,7 +399,9 @@ export class ASTInterpreter {
   private stepMode = false;
   private aborted = false;
   private startTime = 0;
+  private pausedAccumulatedMs = 0;
   private currentLine: number | null = null;
+  private totalOps = 0;
   private opsSinceYield = 0;
   private lastYieldAt = 0;
   private resumeResolver: ((mode: 'step' | 'continue' | 'stop') => void) | null = null;
@@ -349,6 +409,9 @@ export class ASTInterpreter {
 
   constructor(options: InterpreterOptions = {}) {
     this.options = options;
+    const pm = new SecurityPolicyManager(options.securityPolicy);
+    this.securityPolicy = pm.policy;
+    this.networkManager = pm.getNetworkManager();
     this.stdinQueue = [...(options.stdin ?? [])];
     this.breakpoints = new Set(options.breakpoints ?? []);
     this.stepMode = Boolean(options.startPaused);
@@ -374,6 +437,20 @@ export class ASTInterpreter {
       this.yourgui.dispatchEvent(elementId, eventType, payload)
     );
     this.installStdlib(this.globalEnv);
+  }
+
+  private getSandboxGlobalThis(): Record<string, unknown> {
+    const mode = this.securityPolicy.globals.globalThisMode;
+    if (mode === 'disabled') {
+      throw new Error("SecurityError: Access to 'globalThis' is disabled by security policy");
+    }
+    if (!this.sandboxGlobalThis) {
+      const base: Record<string, unknown> = {
+        location: Object.freeze(this.getBrowserLocation()),
+      };
+      this.sandboxGlobalThis = mode === 'readonly' ? Object.freeze(base) : base;
+    }
+    return this.sandboxGlobalThis;
   }
 
   public setBreakpoints(lines: number[]): void {
@@ -419,6 +496,8 @@ export class ASTInterpreter {
 
   public async execute(program: ProgramNode): Promise<ExecutionResult> {
     this.startTime = performance.now();
+    this.pausedAccumulatedMs = 0;
+    this.totalOps = 0;
     this.opsSinceYield = 0;
     this.lastYieldAt = this.startTime;
     this.callStack.push({ name: '<module>', line: 1 });
@@ -470,6 +549,24 @@ export class ASTInterpreter {
     }
   }
 
+  private checkExecutionBudget(): void {
+    if (this.aborted) throw new ExitSignal('Stopped by debugger');
+    this.totalOps++;
+    if (this.totalOps > MAX_INTERPRETER_OPS) {
+      throw new Error(
+        `SecurityError: Interpreter execution budget (${MAX_INTERPRETER_OPS} operations) exceeded`
+      );
+    }
+    if (!this.stepMode && this.breakpoints.size === 0) {
+      const activeElapsed = performance.now() - this.startTime - this.pausedAccumulatedMs;
+      if (activeElapsed > MAX_INTERPRETER_MS) {
+        throw new Error(
+          `SecurityError: Interpreter execution time limit (${MAX_INTERPRETER_MS}ms) exceeded`
+        );
+      }
+    }
+  }
+
   private async maybePauseAt(line: number, env: Environment): Promise<void> {
     if (this.aborted) throw new ExitSignal('Stopped by debugger');
     this.activeEnv = env;
@@ -481,17 +578,19 @@ export class ASTInterpreter {
     const shouldPause = this.stepMode || this.breakpoints.has(line);
     if (!shouldPause || !this.options.onPause) return;
 
+    const pauseStarted = performance.now();
     this.options.onPause(this.getSnapshot('paused'));
     const action = await new Promise<'step' | 'continue' | 'stop'>((resolve) => {
       this.resumeResolver = resolve;
     });
+    this.pausedAccumulatedMs += performance.now() - pauseStarted;
     if (action === 'stop' || this.aborted) {
       throw new ExitSignal('Stopped by debugger');
     }
   }
 
   private async tickLoop(): Promise<void> {
-    if (this.aborted) throw new ExitSignal('Stopped by debugger');
+    this.checkExecutionBudget();
     this.opsSinceYield++;
     if (this.opsSinceYield >= 200 || performance.now() - this.lastYieldAt > 12) {
       this.opsSinceYield = 0;
@@ -540,6 +639,7 @@ export class ASTInterpreter {
   }
 
   private async execStatement(stmt: StatementNode, env: Environment): Promise<unknown> {
+    this.checkExecutionBudget();
     await this.maybePauseAt(stmt.line, env);
 
     switch (stmt.kind) {
@@ -878,6 +978,17 @@ export class ASTInterpreter {
         return expr.value;
 
       case 'Identifier':
+        if (expr.name === 'globalThis') {
+          return this.getSandboxGlobalThis();
+        }
+        if (!env.has(expr.name)) {
+          if (this.securityPolicy.globals.forbidDynamicEval && INTERPRETER_EVAL_GLOBALS.has(expr.name)) {
+            throw new Error(`SecurityError: Dynamic code evaluation via '${expr.name}' is disabled in sandbox`);
+          }
+          if (this.securityPolicy.globals.forbidHostEscapeGlobals && INTERPRETER_ESCAPE_GLOBALS.has(expr.name)) {
+            throw new Error(`SecurityError: Host escape global '${expr.name}' is blocked in sandbox`);
+          }
+        }
         return env.get(expr.name);
 
       case 'SelfExpression':
@@ -904,9 +1015,12 @@ export class ASTInterpreter {
       case 'MapLiteral': {
         const obj: Record<string, unknown> = {};
         for (const entry of expr.entries) {
-          const k = await this.evalExpr(entry.key, env);
+          const k = String(await this.evalExpr(entry.key, env));
+          if (this.isBlockedProperty(k)) {
+            throw new Error(`SecurityError: Property key '${k}' is blocked in sandbox`);
+          }
           const v = await this.evalExpr(entry.value, env);
-          obj[String(k)] = v;
+          obj[k] = v;
         }
         return obj;
       }
@@ -996,6 +1110,9 @@ export class ASTInterpreter {
       case 'AssignmentExpression': {
         const rhs = await this.evalExpr(expr.value, env);
         if (expr.target.kind === 'Identifier') {
+          if (expr.target.name === 'globalThis') {
+            throw new Error("SecurityError: Reassigning 'globalThis' is forbidden");
+          }
           const finalVal = expr.operator === '='
             ? rhs
             : this.applyCompoundOp(expr.operator, env.get(expr.target.name), rhs);
@@ -1290,6 +1407,11 @@ export class ASTInterpreter {
         fnEnv.define(p.name, val, true, 'param');
       }
 
+      if (this.callStack.length >= MAX_CALL_DEPTH) {
+        throw new Error(
+          `SecurityError: Maximum call stack depth (${MAX_CALL_DEPTH}) exceeded`
+        );
+      }
       this.callStack.push({ name: callable.name, line });
       try {
         if (callable.body.kind === 'BlockStatement') {
@@ -1770,15 +1892,14 @@ export class ASTInterpreter {
   }
 
   private getBrowserLocation(): Record<string, string> {
-    const loc = typeof globalThis !== 'undefined' && globalThis.location ? globalThis.location : null;
     return {
-      href: loc ? String(loc.href || 'about:blank') : 'about:blank',
-      pathname: loc ? String(loc.pathname || '/') : '/',
-      hostname: loc ? String(loc.hostname || 'localhost') : 'localhost',
-      origin: loc ? String(loc.origin || 'null') : 'null',
-      protocol: loc ? String(loc.protocol || 'http:') : 'http:',
-      search: loc ? String(loc.search || '') : '',
-      hash: loc ? String(loc.hash || '') : '',
+      href: 'https://sandbox.easyjs.local/',
+      pathname: '/',
+      hostname: 'sandbox.easyjs.local',
+      origin: 'https://sandbox.easyjs.local',
+      protocol: 'https:',
+      search: '',
+      hash: '',
     };
   }
 
@@ -2393,17 +2514,22 @@ export class ASTInterpreter {
     });
     def('listen', async (p = 'Listening: ') => readInputRaw(String(p)));
     def('fetch', async (url: unknown, opts?: RequestInit) => {
-      const raw = String(url ?? '');
-      let parsed: URL;
-      try {
-        parsed = new URL(raw, 'https://sandbox.invalid');
-      } catch {
-        throw new Error(`SecurityError: Invalid fetch URL '${raw}'`);
+      const hostFetch =
+        typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+          ? globalThis.fetch.bind(globalThis)
+          : null;
+      if (!hostFetch) {
+        const check = this.networkManager.validateFetchCall(String(url ?? ''), opts, true);
+        if (!check.ok) {
+          throw new Error(check.reason);
+        }
+        throw new Error('SandboxError: fetch() is unavailable in this environment');
       }
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new Error(`SecurityError: Blocked fetch protocol '${parsed.protocol}' in sandbox`);
-      }
-      const res = await globalThis.fetch(parsed.toString(), opts);
+      const res = await this.networkManager.executeBoundedFetch(
+        hostFetch,
+        String(url ?? ''),
+        opts
+      );
       const ct = res.headers?.get?.('content-type') || '';
       return ct.includes('application/json') ? res.json() : res.text();
     });
