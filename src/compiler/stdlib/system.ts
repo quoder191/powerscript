@@ -30,6 +30,9 @@ export const SYSTEM_STDLIB_SOURCE = `
     return Math.min(MAX_TIMER_DELAY_MS, Math.max(minMs, Math.trunc(n)));
   };
 
+  // Ephemeral, per-execution in-memory virtual filesystem (Map<string, string>).
+  // NOTE: This is an isolated virtual namespace scoped strictly to the current execution,
+  // NOT an operating-system kernel chroot; real OS filesystem isolation is enforced at the process layer.
   const MAX_VFS_FILES = 64;
   const MAX_VFS_FILE_BYTES = 131072;
   const MAX_VFS_TOTAL_BYTES = 524288;
@@ -37,15 +40,31 @@ export const SYSTEM_STDLIB_SOURCE = `
   const memoryVfs = new Map();
 
   const normalizeVfsPath = (rawPath) => {
-    const input = String(rawPath ?? "");
-    if (!input || input.length > 256 || /[\\u0000-\\u001f\\u007f]/.test(input)) {
+    const raw = String(rawPath ?? "");
+    if (!raw || raw.length > 256 || /[\\u0000-\\u001f\\u007f]/.test(raw)) {
       throw new Error("SecurityError: Invalid VFS file path");
     }
-    const normalized = input.replace(/\\\\/g, "/").trim();
+    if (/%2e|%2f|%5c/i.test(raw)) {
+      throw new Error("SecurityError: Encoded VFS path traversal sequence is blocked");
+    }
+    let decoded = raw;
+    for (let pass = 0; pass < 3; pass++) {
+      try {
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch {
+        throw new Error("SecurityError: Malformed percent-encoding in VFS file path");
+      }
+    }
+    if (/[\\u0000-\\u001f\\u007f]/.test(decoded)) {
+      throw new Error("SecurityError: Invalid control character in VFS file path");
+    }
+    const normalized = decoded.replace(/\\\\/g, "/").trim();
     if (!normalized) {
       throw new Error("SecurityError: Invalid empty VFS path");
     }
-    // Strip optional leading /sandbox prefix so paths resolve strictly inside /sandbox chroot
+    // Strip optional /sandbox virtual prefix; paths stay confined within this run's ephemeral VFS map
     const trimmedLeading = normalized.replace(/^\\/+/, "");
     const rel = trimmedLeading === "sandbox"
       ? ""
@@ -59,7 +78,7 @@ export const SYSTEM_STDLIB_SOURCE = `
       if (seg === ".") continue;
       if (seg === "..") {
         if (resolved.length === 0) {
-          throw new Error("SecurityError: VFS path traversal outside '/sandbox' is blocked");
+          throw new Error("SecurityError: Ephemeral VFS path traversal outside '/sandbox' is blocked");
         }
         resolved.pop();
         continue;

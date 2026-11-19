@@ -79,6 +79,19 @@ async function getSessionToken(forceRefresh = false): Promise<string> {
   return pendingSessionFetch;
 }
 
+function createRequestReplayHeaders(): Record<string, string> {
+  let nonce: string;
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    nonce = crypto.randomUUID();
+  } else {
+    nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+  return {
+    'X-Request-Nonce': nonce,
+    'X-Request-Timestamp': String(Date.now()),
+  };
+}
+
 async function postJsonAuthenticated(
   url: string,
   body: Record<string, unknown>
@@ -90,6 +103,7 @@ async function postJsonAuthenticated(
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
+      ...createRequestReplayHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -102,6 +116,7 @@ async function postJsonAuthenticated(
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        ...createRequestReplayHeaders(),
       },
       body: JSON.stringify(body),
     });

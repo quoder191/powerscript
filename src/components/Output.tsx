@@ -9,6 +9,10 @@ import type {
   RegisteredRouteInfo,
   VisualOutputItem,
 } from '../compiler/index.ts';
+import {
+  sanitizeYourGuiHtmlString,
+  YOURGUI_SANITIZER_JS_SOURCE,
+} from '../compiler/stdlib/yourgui/sanitizer.ts';
 
 interface OutputProps {
   compileResult: CompileResult;
@@ -340,11 +344,7 @@ const STATIC_HTML_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; img-src https: http:; object-src 'none'; base-uri 'none'; form-action 'none';";
 
 function sanitizeStaticHtmlForSandbox(raw: string): string {
-  const cleaned = String(raw ?? '')
-    .replace(/<\s*(script|iframe|object|embed|svg|math|meta|base|link)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
-    .replace(/<\s*(script|iframe|object|embed|svg|math|meta|base|link)\b[^>]*\/?>/gi, '')
-    .replace(/\son[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/(?:javascript|vbscript)\s*:/gi, 'blocked:');
+  const cleaned = sanitizeYourGuiHtmlString(raw);
   return `<!doctype html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="${STATIC_HTML_CSP}" /></head><body>${cleaned}</body></html>`;
 }
 
@@ -426,133 +426,7 @@ export function buildYourGuiIframeSrcDoc(pageId: string, frameToken = ''): strin
   const PAGE = ${bootstrapData};
   let latestPayload = null;
 
-  const ALLOWED_TAGS = new Set([
-    'div','span','p','section','article','main','header','footer','nav','aside',
-    'h1','h2','h3','h4','h5','h6','button','input','textarea','select','option','optgroup',
-    'label','form','hr','br','a','img','video','audio','source',
-    'ul','ol','li','table','thead','tbody','tfoot','tr','th','td',
-    'strong','b','em','i','u','s','code','pre','blockquote','small','sub','sup'
-  ]);
-  const DROP_SUBTREE_TAGS = new Set([
-    'script','style','iframe','object','embed','svg','math','meta','base','link','template','noscript'
-  ]);
-  const ALLOWED_ATTRS = new Set([
-    'id','class','type','value','placeholder','name','checked','disabled','readonly','required',
-    'min','max','step','maxlength','minlength','rows','cols','selected','multiple',
-    'alt','title','href','src','poster','target','rel','controls','loop','muted',
-    'autoplay','colspan','rowspan','for','role'
-  ]);
-  const URL_ATTRS = new Set(['href','src','poster']);
-
-  const sanitizeUrl = (raw, allowImageData) => {
-    const val = String(raw || '').trim();
-    if (!val) return '';
-    if (val === '#' || val.startsWith('#') || (val.startsWith('/') && !val.startsWith('//'))) {
-      return val;
-    }
-    const compact = val.replace(/[\\u0000-\\u0020\\u007f]+/g, '');
-    if (/^(javascript|vbscript|file):/i.test(compact)) return '#';
-    if (/^data:/i.test(compact)) {
-      if (allowImageData && /^data:image\\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=]+$/i.test(compact)) {
-        return val;
-      }
-      return '#';
-    }
-    try {
-      const u = new URL(val);
-      if (u.protocol === 'http:' || u.protocol === 'https:') return val;
-    } catch {
-      if (!compact.includes(':')) return val;
-    }
-    return '#';
-  };
-
-  const sanitizeCss = (rawCss) => {
-    return String(rawCss || '')
-      .slice(0, 32768)
-      .replace(/<\\/\\s*style/gi, ' ')
-      .replace(/@import\\b[^;}\\n]*;?/gi, '/* blocked */')
-      .replace(/@charset\\b[^;}\\n]*;?/gi, '')
-      .replace(/expression\\s*\\([^)]*\\)/gi, 'none')
-      .replace(/-moz-binding\\s*:[^;}\\n]*/gi, '')
-      .replace(/behavior\\s*:[^;}\\n]*/gi, '')
-      .replace(/url\\s*\\([^)]*\\)/gi, 'none')
-      .replace(/javascript\\s*:/gi, '')
-      .replace(/vbscript\\s*:/gi, '');
-  };
-
-  const sanitizeStyleVal = (val) => {
-    const s = String(val ?? '').slice(0, 512);
-    if (/expression\\s*\\(|-moz-binding|behavior\\s*:|@import|url\\s*\\(|javascript\\s*:|vbscript\\s*:/i.test(s)) {
-      return '';
-    }
-    return s.replace(/[;{}]/g, ' ').trim();
-  };
-
-  const isAllowedAttr = (attrName) => {
-    const k = String(attrName || '').toLowerCase();
-    if (k.startsWith('on')) return false;
-    if (k === 'data-yg-id') return false;
-    return ALLOWED_ATTRS.has(k) || /^aria-[a-z0-9_-]+$/.test(k) || /^data-[a-z0-9_-]+$/.test(k);
-  };
-
-  const sanitizeElementTree = (srcNode, outDoc) => {
-    if (srcNode.nodeType === 3) {
-      return outDoc.createTextNode(srcNode.textContent || '');
-    }
-    if (srcNode.nodeType !== 1) return null;
-    const tag = String(srcNode.tagName || '').toLowerCase();
-    if (DROP_SUBTREE_TAGS.has(tag)) return null;
-
-    if (!ALLOWED_TAGS.has(tag)) {
-      const frag = outDoc.createDocumentFragment();
-      for (const ch of Array.from(srcNode.childNodes)) {
-        const clean = sanitizeElementTree(ch, outDoc);
-        if (clean) frag.appendChild(clean);
-      }
-      return frag;
-    }
-
-    const cleanEl = outDoc.createElement(tag);
-    for (const attr of Array.from(srcNode.attributes || [])) {
-      const k = String(attr.name || '').toLowerCase();
-      if (!isAllowedAttr(k)) continue;
-      if (URL_ATTRS.has(k)) {
-        const safeUrl = sanitizeUrl(attr.value, k === 'src' || k === 'poster');
-        cleanEl.setAttribute(k, safeUrl || '#');
-      } else {
-        cleanEl.setAttribute(k, attr.value);
-      }
-    }
-    if (tag === 'a' && cleanEl.getAttribute('target') === '_blank') {
-      cleanEl.setAttribute('rel', 'noopener noreferrer');
-    }
-    for (const ch of Array.from(srcNode.childNodes)) {
-      const clean = sanitizeElementTree(ch, outDoc);
-      if (clean) cleanEl.appendChild(clean);
-    }
-    return cleanEl;
-  };
-
-  const sanitizeHtml = (raw) => {
-    const str = String(raw || '').slice(0, 32768);
-    if (typeof DOMParser === 'function') {
-      try {
-        const parsed = new DOMParser().parseFromString(str, 'text/html');
-        const container = document.createElement('div');
-        for (const child of Array.from(parsed.body.childNodes)) {
-          const safeChild = sanitizeElementTree(child, document);
-          if (safeChild) container.appendChild(safeChild);
-        }
-        return container.innerHTML;
-      } catch {
-        // Fallback text escape below
-      }
-    }
-    const fallback = document.createElement('div');
-    fallback.textContent = str;
-    return fallback.innerHTML;
-  };
+${YOURGUI_SANITIZER_JS_SOURCE}
 
   const postEvt = (id, eventType, el) => {
     window.parent.postMessage({
@@ -567,20 +441,19 @@ export function buildYourGuiIframeSrcDoc(pageId: string, frameToken = ''): strin
   };
 
   const buildNode = (snap) => {
-    const rawTag = String(snap.tag || 'div').toLowerCase();
-    const safeTag = ALLOWED_TAGS.has(rawTag) ? rawTag : 'div';
+    const safeTag = normalizeYourGuiTag(snap.tag || 'div');
     const el = document.createElement(safeTag);
     el.setAttribute('data-yg-id', String(snap.id || ''));
 
     if (snap.attrs) {
       for (const [rawKey, v] of Object.entries(snap.attrs)) {
         const k = String(rawKey).toLowerCase();
-        if (k === 'class') { el.className = String(v); }
+        if (k === 'class') { el.className = String(v).replace(/[<>"]/g, ''); }
         else if (k === 'value' && 'value' in el) { el.value = String(v); }
         else if (k === 'checked' && 'checked' in el) { el.checked = Boolean(v); }
-        else if (!isAllowedAttr(k)) { continue; }
-        else if (URL_ATTRS.has(k)) {
-          const safeUrl = sanitizeUrl(String(v ?? ''), k === 'src' || k === 'poster');
+        else if (!isSafeYourGuiAttr(k)) { continue; }
+        else if (YG_URL_ATTRS.has(k)) {
+          const safeUrl = sanitizeYourGuiUrl(String(v ?? ''), k === 'src' || k === 'poster');
           el.setAttribute(k, safeUrl || '#');
         }
         else if (v === true) { el.setAttribute(k, ''); }
@@ -594,13 +467,13 @@ export function buildYourGuiIframeSrcDoc(pageId: string, frameToken = ''): strin
     if (snap.style) {
       for (const [sk, sv] of Object.entries(snap.style)) {
         if (!/^[a-zA-Z-]+$/.test(sk) || sk === '__proto__' || sk === 'constructor' || sk === 'prototype') continue;
-        const safeSv = sanitizeStyleVal(sv);
+        const safeSv = sanitizeYourGuiStyleValue(sv);
         if (safeSv) el.style[sk] = safeSv;
       }
     }
 
     if (snap.html !== undefined && (!snap.children || snap.children.length === 0)) {
-      el.innerHTML = sanitizeHtml(snap.html);
+      el.innerHTML = sanitizeYourGuiHtml(snap.html);
     } else if (snap.textContent !== undefined && (!snap.children || snap.children.length === 0)) {
       el.textContent = snap.textContent;
     }
@@ -644,7 +517,7 @@ export function buildYourGuiIframeSrcDoc(pageId: string, frameToken = ''): strin
     const styleEl = document.getElementById('yourgui-user-css');
     if (styleEl) {
       styleEl.textContent = Array.isArray(payload.styles)
-        ? payload.styles.map((css) => sanitizeCss(css)).join('\\n\\n')
+        ? payload.styles.map((css) => sanitizeYourGuiCss(css)).join('\\n\\n')
         : '';
     }
 
@@ -773,12 +646,15 @@ function YourGuiBrowserPreview({
       }
       if (
         typeof data.elementId === 'string' &&
+        data.elementId.length > 0 &&
+        data.elementId.length <= 64 &&
         typeof data.eventType === 'string' &&
+        ['click', 'input', 'change', 'submit'].includes(data.eventType) &&
         onGuiEventRef.current
       ) {
         onGuiEventRef.current(data.elementId, data.eventType, {
-          value: data.value,
-          checked: data.checked,
+          value: typeof data.value === 'string' ? data.value : undefined,
+          checked: typeof data.checked === 'boolean' ? data.checked : undefined,
         });
       }
     };

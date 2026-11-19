@@ -18,6 +18,7 @@ import {
   VisualOutputItem,
 } from '../utils/helpers.ts';
 import { YourGuiEngine } from '../stdlib/yourgui/index.ts';
+import { sanitizeYourGuiHtmlString } from '../stdlib/yourgui/sanitizer.ts';
 import {
   NetworkPolicyManager,
   SecurityPolicyManager,
@@ -2683,12 +2684,29 @@ export class ASTInterpreter {
       return Math.min(MAX_TIMER_DELAY_MS, Math.max(minMs, Math.trunc(n)));
     };
 
+    // Ephemeral per-run in-memory VFS (isolated Map instance per ASTInterpreter run, NOT an OS chroot)
     const normalizeVfsPath = (rawPath: unknown): string => {
-      const input = String(rawPath ?? '');
-      if (!input || input.length > 256 || /[\u0000-\u001f\u007f]/.test(input)) {
+      const raw = String(rawPath ?? '');
+      if (!raw || raw.length > 256 || /[\u0000-\u001f\u007f]/.test(raw)) {
         throw new Error('SecurityError: Invalid VFS file path');
       }
-      const normalized = input.replace(/\\/g, '/').trim();
+      if (/%2e|%2f|%5c/i.test(raw)) {
+        throw new Error('SecurityError: Encoded VFS path traversal sequence is blocked');
+      }
+      let decoded = raw;
+      for (let pass = 0; pass < 3; pass++) {
+        try {
+          const next = decodeURIComponent(decoded);
+          if (next === decoded) break;
+          decoded = next;
+        } catch {
+          throw new Error('SecurityError: Malformed percent-encoding in VFS file path');
+        }
+      }
+      if (/[\u0000-\u001f\u007f]/.test(decoded)) {
+        throw new Error('SecurityError: Invalid control character in VFS file path');
+      }
+      const normalized = decoded.replace(/\\/g, '/').trim();
       if (!normalized) throw new Error('SecurityError: Invalid empty VFS path');
       const trimmedLeading = normalized.replace(/^\/+/, '');
       const rel =
@@ -2703,7 +2721,7 @@ export class ASTInterpreter {
         if (seg === '.') continue;
         if (seg === '..') {
           if (resolved.length === 0) {
-            throw new Error("SecurityError: VFS path traversal outside '/sandbox' is blocked");
+            throw new Error("SecurityError: Ephemeral VFS path traversal outside '/sandbox' is blocked");
           }
           resolved.pop();
           continue;
@@ -2964,7 +2982,7 @@ export class ASTInterpreter {
     });
 
     def('ui', {
-      html: (markup: unknown) => emitVisual({ kind: 'html', content: String(markup ?? '') }),
+      html: (markup: unknown) => emitVisual({ kind: 'html', content: sanitizeYourGuiHtmlString(markup) }),
       card: (title: unknown, body: unknown, footer = '') =>
         emitVisual({ kind: 'card', title: formatVal(title), body: formatVal(body), footer: footer ? formatVal(footer) : '' }),
       table: (rows: Array<Record<string, unknown>> = [], columns?: string[]) => {

@@ -2,6 +2,8 @@ import { runAsyncInSandbox } from '../src/compiler/sandbox.ts';
 import type { PartialCompilerSecurityPolicy } from '../src/compiler/security-policy.ts';
 import type { ExecutionResult } from '../src/compiler/utils/helpers.ts';
 
+export const WORKER_RESULT_PREFIX = '__PS_WORKER_RESULT__:';
+
 interface WorkerExecuteRequest {
   type: 'execute';
   code: string;
@@ -11,6 +13,7 @@ interface WorkerExecuteRequest {
 
 const MAX_WORKER_LIFETIME_MS = 6500;
 const MAX_CODE_CHARS = 250_000;
+const MAX_STDIN_PAYLOAD_BYTES = 512_000;
 const MAX_LOG_LINES = 2000;
 const MAX_LOG_LINE_CHARS = 4096;
 const MAX_POINTER_EVENTS = 1000;
@@ -70,7 +73,7 @@ const finish = (payload: Record<string, unknown>, exitCode = 0): void => {
       process.exit(exitCode);
     });
   } else {
-    process.stdout.write(JSON.stringify(payload) + '\n', () => {
+    process.stdout.write(WORKER_RESULT_PREFIX + JSON.stringify(payload) + '\n', () => {
       process.exit(exitCode);
     });
   }
@@ -107,7 +110,7 @@ process.on('unhandledRejection', (reason) => {
   );
 });
 
-process.on('message', async (raw: unknown) => {
+async function handleRequest(raw: unknown): Promise<void> {
   const msg = raw as WorkerExecuteRequest | null;
   if (
     !msg ||
@@ -136,4 +139,31 @@ process.on('message', async (raw: unknown) => {
       1
     );
   }
-});
+}
+
+if (sendMessage) {
+  process.on('message', (raw: unknown) => {
+    void handleRequest(raw);
+  });
+} else {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  process.stdin.on('data', (chunk: Buffer) => {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > MAX_STDIN_PAYLOAD_BYTES) {
+      finish({ ok: false, error: 'Sandbox worker input payload exceeded 512KB limit' }, 1);
+      return;
+    }
+    chunks.push(chunk);
+  });
+  process.stdin.on('end', () => {
+    if (settled) return;
+    try {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+      void handleRequest(parsed);
+    } catch {
+      finish({ ok: false, error: 'Malformed JSON payload passed to sandbox worker' }, 1);
+    }
+  });
+  process.stdin.resume();
+}

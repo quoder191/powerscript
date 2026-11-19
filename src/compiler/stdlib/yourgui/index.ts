@@ -1,6 +1,7 @@
 import type { GuiVNodeSnapshot, VisualOutputItem } from '../../utils/helpers.ts';
 import {
   isSafeYourGuiAttrName,
+  normalizeYourGuiTag,
   sanitizeYourGuiCssText,
   sanitizeYourGuiHtmlString,
   sanitizeYourGuiStyleValue,
@@ -232,7 +233,7 @@ export class YourGuiEngine {
   }
 
   private normalizeDomId(raw: unknown): string {
-    return String(raw ?? '').trim().replace(/^#/, '');
+    return String(raw ?? '').trim().replace(/^#/, '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
   }
 
   private isHashIdArg(v: unknown): v is string {
@@ -261,7 +262,7 @@ export class YourGuiEngine {
     if (this.nodeRegistry.size >= 1000) {
       throw new Error('SecurityError: yourgui DOM node quota (1000) exceeded');
     }
-    const safeTag = /^[a-z0-9]+$/i.test(String(tag || '')) ? String(tag).toLowerCase() : 'div';
+    const safeTag = normalizeYourGuiTag(tag);
     const id = `el_${this.nextId++}`;
     const attrs: Record<string, string | boolean> = {};
     const styleObj: Record<string, string> = {};
@@ -275,6 +276,7 @@ export class YourGuiEngine {
     let customId = '';
 
     const emit = () => this.requestEmit();
+    const normalizeDomId = (raw: unknown) => this.normalizeDomId(raw);
     const rootNodes = this.rootNodes;
     const nodeRegistry = this.nodeRegistry;
     const idRegistry = this.idRegistry;
@@ -318,7 +320,7 @@ export class YourGuiEngine {
         if (customId && idRegistry.get(customId) === handle) {
           idRegistry.delete(customId);
         }
-        const clean = String(v ?? '').trim().replace(/^#/, '');
+        const clean = normalizeDomId(v);
         customId = clean;
         if (clean) {
           attrs.id = clean;
@@ -330,7 +332,7 @@ export class YourGuiEngine {
       },
 
       get className(): string { return String(attrs.class ?? ''); },
-      set className(v: string) { attrs.class = String(v); emit(); },
+      set className(v: string) { attrs.class = String(v ?? '').replace(/[<>"]/g, ''); emit(); },
 
       get textContent(): string { return textContent; },
       set textContent(v: string) {

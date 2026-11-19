@@ -16,7 +16,7 @@ export const YOURGUI_DOM_SOURCE = `
     let scheduleFlush = false;
     let dirty = false;
 
-    const normalizeDomId = (raw) => String(raw ?? "").trim().replace(/^#/, "");
+    const normalizeDomId = (raw) => String(raw ?? "").trim().replace(/^#/, "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
     const isHashIdArg = (v) => typeof v === "string" && v.startsWith("#") && v.length > 1;
     const findElementById = (rawId) => {
       const clean = normalizeDomId(rawId);
@@ -80,7 +80,7 @@ export const YOURGUI_DOM_SOURCE = `
       if (nodeRegistry.size >= MAX_GUI_NODES) {
         throw new Error("SecurityError: yourgui DOM node quota (" + MAX_GUI_NODES + ") exceeded");
       }
-      const safeTag = /^[a-z0-9]+$/i.test(String(tag || "")) ? String(tag).toLowerCase() : "div";
+      const safeTag = normalizeYourGuiTag(tag);
       const id = "el_" + (nextId++);
       const attrs = {};
       const styleObj = {};
@@ -118,7 +118,7 @@ export const YOURGUI_DOM_SOURCE = `
       const handle = {
         __isGuiElement: true,
         __guiId: id,
-        __tag: tag,
+        __tag: safeTag,
         __dom: domEl,
         style: styleProxy,
 
@@ -127,7 +127,7 @@ export const YOURGUI_DOM_SOURCE = `
           if (customId && idRegistry.get(customId) === handle) {
             idRegistry.delete(customId);
           }
-          const clean = String(v ?? "").trim().replace(/^#/, "");
+          const clean = normalizeDomId(v);
           customId = clean;
           if (clean) {
             attrs.id = clean;
@@ -142,7 +142,7 @@ export const YOURGUI_DOM_SOURCE = `
 
         get className() { return attrs.class ?? ""; },
         set className(v) {
-          attrs.class = String(v);
+          attrs.class = String(v ?? "").replace(/[<>"]/g, "");
           if (domEl) domEl.className = attrs.class;
           requestEmit();
         },
@@ -371,11 +371,15 @@ export const YOURGUI_DOM_SOURCE = `
             if (domEl) domEl.removeAttribute(key);
           } else {
             let safeVal = v === true ? true : String(v);
-            if (safeVal !== true && (lower === "href" || lower === "src" || lower === "poster" || lower === "action")) {
+            if (safeVal !== true && (lower === "href" || lower === "src" || lower === "poster")) {
               safeVal = sanitizeYourGuiUrl(safeVal, lower === "src" || lower === "poster") || "#";
             }
             attrs[key] = safeVal;
             if (domEl) domEl.setAttribute(key, safeVal === true ? "" : safeVal);
+            if (safeTag === "a" && lower === "target" && String(safeVal).trim().toLowerCase() === "_blank") {
+              attrs.rel = "noopener noreferrer";
+              if (domEl) domEl.setAttribute("rel", "noopener noreferrer");
+            }
           }
           requestEmit();
           return handle;
@@ -599,7 +603,7 @@ export const YOURGUI_DOM_SOURCE = `
         },
 
         toString() {
-          return "<" + tag + "#" + (customId || id) + ">";
+          return "<" + safeTag + "#" + (customId || id) + ">";
         },
 
         _detach() {
@@ -631,7 +635,7 @@ export const YOURGUI_DOM_SOURCE = `
           if (payload.checked !== undefined) {
             const nextChecked = Boolean(payload.checked);
             attrs.checked = nextChecked;
-            if (tag === "input" && attrs.type === "radio" && attrs.name && nextChecked) {
+            if (safeTag === "input" && attrs.type === "radio" && attrs.name && nextChecked) {
               for (const other of nodeRegistry.values()) {
                 if (other !== handle && other.__tag === "input" && other.getAttr("type") === "radio" && other.getAttr("name") === attrs.name) {
                   other._setRadioCheckedQuiet(false);
@@ -648,7 +652,7 @@ export const YOURGUI_DOM_SOURCE = `
         _toSnapshot() {
           return {
             id,
-            tag,
+            tag: safeTag,
             textContent: children.length === 0 ? textContent : undefined,
             html: children.length === 0 ? htmlContent : undefined,
             attrs: { ...attrs },
