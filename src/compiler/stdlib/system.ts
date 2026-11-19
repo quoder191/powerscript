@@ -7,6 +7,9 @@ export const SYSTEM_STDLIB_SOURCE = `
     }
   }
 
+  const MAX_ACTIVE_TIMERS = 32;
+  const MIN_TIMER_INTERVAL_MS = 10;
+  const MAX_TIMER_DELAY_MS = 60000;
   const activeTimeouts = new Set();
   const activeIntervals = new Set();
 
@@ -17,56 +20,116 @@ export const SYSTEM_STDLIB_SOURCE = `
     activeIntervals.clear();
   };
 
-  const VFS_PREFIX = "easyjs_vfs:";
+  const totalActiveTimers = () => activeTimeouts.size + activeIntervals.size;
+
+  const sanitizeDelayMs = (rawMs, minMs = 0) => {
+    const n = Number(rawMs);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new Error("SecurityError: Timer/sleep delay must be a non-negative finite number");
+    }
+    return Math.min(MAX_TIMER_DELAY_MS, Math.max(minMs, Math.trunc(n)));
+  };
+
+  const MAX_VFS_FILES = 64;
+  const MAX_VFS_FILE_BYTES = 131072;
+  const MAX_VFS_TOTAL_BYTES = 524288;
+  const BLOCKED_VFS_NAMES = new Set(["__proto__", "constructor", "prototype"]);
   const memoryVfs = new Map();
-  const isSandboxed = Boolean(ioHandler && ioHandler.sandboxed);
+
+  const normalizeVfsPath = (rawPath) => {
+    const input = String(rawPath ?? "");
+    if (!input || input.length > 256 || /[\\u0000-\\u001f\\u007f]/.test(input)) {
+      throw new Error("SecurityError: Invalid VFS file path");
+    }
+    const normalized = input.replace(/\\\\/g, "/").trim();
+    if (!normalized) {
+      throw new Error("SecurityError: Invalid empty VFS path");
+    }
+    // Strip optional leading /sandbox prefix so paths resolve strictly inside /sandbox chroot
+    const trimmedLeading = normalized.replace(/^\\/+/, "");
+    const rel = trimmedLeading === "sandbox"
+      ? ""
+      : trimmedLeading.startsWith("sandbox/")
+        ? trimmedLeading.slice("sandbox/".length)
+        : trimmedLeading;
+
+    const parts = rel.split("/").filter(Boolean);
+    const resolved = [];
+    for (const seg of parts) {
+      if (seg === ".") continue;
+      if (seg === "..") {
+        if (resolved.length === 0) {
+          throw new Error("SecurityError: VFS path traversal outside '/sandbox' is blocked");
+        }
+        resolved.pop();
+        continue;
+      }
+      if (BLOCKED_VFS_NAMES.has(seg)) {
+        throw new Error(\`SecurityError: Reserved VFS segment '\${seg}' is blocked\`);
+      }
+      resolved.push(seg);
+    }
+    if (resolved.length === 0) {
+      throw new Error("SecurityError: VFS path must reference a file inside '/sandbox'");
+    }
+    return "/sandbox/" + resolved.join("/");
+  };
+
+  const getVfsTotalBytes = () => {
+    let total = 0;
+    for (const val of memoryVfs.values()) total += String(val).length;
+    return total;
+  };
 
   const readFileVfs = (path) => {
-    const key = String(path);
-    if (!isSandboxed && typeof localStorage !== "undefined") {
-      const stored = localStorage.getItem(VFS_PREFIX + key);
-      if (stored !== null) return stored;
-    }
+    const key = normalizeVfsPath(path);
     if (memoryVfs.has(key)) return memoryVfs.get(key);
     throw new Error(\`FileNotFoundError: '\${key}' does not exist\`);
   };
 
   const writeFileVfs = (path, content = "") => {
-    const key = String(path);
+    const key = normalizeVfsPath(path);
     const data = formatVal(content);
-    memoryVfs.set(key, data);
-    if (!isSandboxed && typeof localStorage !== "undefined") {
-      try {
-        localStorage.setItem(VFS_PREFIX + key, data);
-      } catch {
-        // Ignore storage quota errors in restricted sandboxes
-      }
+    if (data.length > MAX_VFS_FILE_BYTES) {
+      throw new Error(\`SecurityError: VFS file size exceeds limit (\${MAX_VFS_FILE_BYTES} chars)\`);
     }
+    if (!memoryVfs.has(key) && memoryVfs.size >= MAX_VFS_FILES) {
+      throw new Error(\`SecurityError: VFS file count limit (\${MAX_VFS_FILES}) exceeded\`);
+    }
+    const prevSize = memoryVfs.has(key) ? String(memoryVfs.get(key)).length : 0;
+    if (getVfsTotalBytes() - prevSize + data.length > MAX_VFS_TOTAL_BYTES) {
+      throw new Error(\`SecurityError: VFS total storage quota (\${MAX_VFS_TOTAL_BYTES} chars) exceeded\`);
+    }
+    memoryVfs.set(key, data);
     return true;
   };
 
   const deleteFileVfs = (path) => {
-    const key = String(path);
-    let removed = memoryVfs.delete(key);
-    if (!isSandboxed && typeof localStorage !== "undefined") {
-      const exists = localStorage.getItem(VFS_PREFIX + key) !== null;
-      if (exists) {
-        localStorage.removeItem(VFS_PREFIX + key);
-        removed = true;
-      }
-    }
-    return removed;
+    const key = normalizeVfsPath(path);
+    return memoryVfs.delete(key);
+  };
+
+  const sanitizeDownloadFilename = (rawName) => {
+    const base = String(rawName ?? "download.txt")
+      .replace(/\\\\/g, "/")
+      .split("/")
+      .pop() || "download.txt";
+    const clean = base.replace(/^\\.+/, "").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
+    return clean || "download.txt";
   };
 
   const downloadFile = (filename, content = undefined) => {
-    const name = String(filename);
+    const safeName = sanitizeDownloadFilename(filename);
     let data = content !== undefined ? formatVal(content) : "";
     if (content === undefined) {
       try {
-        data = readFileVfs(name);
+        data = readFileVfs(safeName);
       } catch {
         data = "";
       }
+    }
+    if (data.length > MAX_VFS_FILE_BYTES) {
+      throw new Error(\`SecurityError: Download payload exceeds limit (\${MAX_VFS_FILE_BYTES} chars)\`);
     }
     if (typeof document !== "undefined" && typeof Blob !== "undefined" && typeof URL !== "undefined") {
       try {
@@ -74,18 +137,18 @@ export const SYSTEM_STDLIB_SOURCE = `
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = name;
+        a.download = safeName;
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 500);
-        console.log(\`[download] Triggered download for '\${name}'\`);
+        console.log(\`[download] Triggered download for '\${safeName}'\`);
         return true;
       } catch {
         // Fallback log
       }
     }
-    console.log(\`[download] \${name} (\${data.length} bytes)\`);
+    console.log(\`[download] \${safeName} (\${data.length} bytes)\`);
     return true;
   };
 
@@ -102,7 +165,11 @@ export const SYSTEM_STDLIB_SOURCE = `
   };
 
   const startTimer = (secondsOrMs, cb = undefined) => {
-    const ms = secondsOrMs > 60 ? secondsOrMs : secondsOrMs * 1000;
+    const rawMs = Number(secondsOrMs) > 60 ? Number(secondsOrMs) : Number(secondsOrMs) * 1000;
+    const ms = sanitizeDelayMs(rawMs, 0);
+    if (totalActiveTimers() >= MAX_ACTIVE_TIMERS) {
+      throw new Error(\`SecurityError: Maximum active timers (\${MAX_ACTIVE_TIMERS}) exceeded\`);
+    }
     if (typeof cb === "function") {
       const id = setTimeout(() => {
         activeTimeouts.delete(id);
@@ -121,11 +188,15 @@ export const SYSTEM_STDLIB_SOURCE = `
   };
 
   const startInterval = (ms, cb) => {
+    const safeMs = sanitizeDelayMs(ms, MIN_TIMER_INTERVAL_MS);
     if (typeof cb !== "function") {
-      console.log(\`[interval] Registered interval (\${ms}ms)\`);
+      console.log(\`[interval] Registered interval (\${safeMs}ms)\`);
       return { stop: () => {} };
     }
-    const id = setInterval(cb, ms);
+    if (totalActiveTimers() >= MAX_ACTIVE_TIMERS) {
+      throw new Error(\`SecurityError: Maximum active timers (\${MAX_ACTIVE_TIMERS}) exceeded\`);
+    }
+    const id = setInterval(cb, safeMs);
     activeIntervals.add(id);
     return {
       stop: () => {

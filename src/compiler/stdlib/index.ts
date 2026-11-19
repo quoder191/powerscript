@@ -283,19 +283,40 @@ ${MODULES_STDLIB_SOURCE}
     }
 
     if (typeof obj === "object") {
+      const isBlockedDictKey = (rawKey) => {
+        const ks = String(rawKey);
+        return ks === "__proto__" || ks === "constructor" || ks === "prototype";
+      };
       switch (method) {
-        case "set":
-          obj[args[0]] = args[1];
+        case "set": {
+          const k = String(args[0]);
+          if (isBlockedDictKey(k)) {
+            throw new Error(\`SecurityError: Prototype-polluting key '\${k}' is blocked\`);
+          }
+          Object.defineProperty(obj, k, {
+            value: args[1],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
           return obj;
-        case "get":
-          return Object.prototype.hasOwnProperty.call(obj, args[0]) ? obj[args[0]] : (args[1] ?? null);
+        }
+        case "get": {
+          const k = String(args[0]);
+          if (isBlockedDictKey(k)) return args[1] ?? null;
+          return Object.prototype.hasOwnProperty.call(obj, k) ? obj[k] : (args[1] ?? null);
+        }
         case "has":
-        case "contains":
-          return Object.prototype.hasOwnProperty.call(obj, args[0]);
+        case "contains": {
+          const k = String(args[0]);
+          return !isBlockedDictKey(k) && Object.prototype.hasOwnProperty.call(obj, k);
+        }
         case "remove":
         case "delete": {
-          const existed = Object.prototype.hasOwnProperty.call(obj, args[0]);
-          delete obj[args[0]];
+          const k = String(args[0]);
+          if (isBlockedDictKey(k)) return false;
+          const existed = Object.prototype.hasOwnProperty.call(obj, k);
+          delete obj[k];
           return existed;
         }
         case "keys":
@@ -313,9 +334,21 @@ ${MODULES_STDLIB_SOURCE}
         case "clear":
           for (const k of Object.keys(obj)) delete obj[k];
           return obj;
-        case "merge":
-          Object.assign(obj, args[0] || {});
+        case "merge": {
+          const src = args[0] && typeof args[0] === "object" ? args[0] : {};
+          for (const [k, v] of Object.entries(src)) {
+            if (isBlockedDictKey(k)) {
+              throw new Error(\`SecurityError: Prototype-polluting key '\${k}' is blocked\`);
+            }
+            Object.defineProperty(obj, k, {
+              value: v,
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            });
+          }
           return obj;
+        }
         case "find": {
           const pred = args[0];
           for (const [k, v] of Object.entries(obj)) {
@@ -415,9 +448,17 @@ ${MODULES_STDLIB_SOURCE}
       return true;
     },
     range: (start, end, inclusive = false) => {
+      const s = Number(start);
+      const e = Number(end);
+      if (!Number.isFinite(s) || !Number.isFinite(e)) {
+        throw new Error("SecurityError: range() bounds must be finite numbers");
+      }
+      const limit = inclusive ? e + 1 : e;
+      if (limit - s > 100000) {
+        throw new Error("SecurityError: range() size exceeds maximum limit (100000)");
+      }
       const out = [];
-      const limit = inclusive ? end + 1 : end;
-      for (let i = start; i < limit; i++) out.push(i);
+      for (let i = s; i < limit; i++) out.push(i);
       return out;
     },
 
@@ -508,10 +549,16 @@ ${MODULES_STDLIB_SOURCE}
     fetch: fetchData,
 
     // System & Filesystem
-    sleep: (ms = 100) => new Promise((resolve) => {
-      const id = setTimeout(() => { activeTimeouts.delete(id); resolve(true); }, ms);
-      activeTimeouts.add(id);
-    }),
+    sleep: (ms = 100) => {
+      const safeMs = sanitizeDelayMs(ms, 0);
+      if (totalActiveTimers() >= MAX_ACTIVE_TIMERS) {
+        return Promise.reject(new Error(\`SecurityError: Maximum active timers (\${MAX_ACTIVE_TIMERS}) exceeded\`));
+      }
+      return new Promise((resolve) => {
+        const id = setTimeout(() => { activeTimeouts.delete(id); resolve(true); }, safeMs);
+        activeTimeouts.add(id);
+      });
+    },
     time: getCurrentTime,
     date: getCurrentDate,
     timer: startTimer,
@@ -531,18 +578,15 @@ ${MODULES_STDLIB_SOURCE}
         return "0x7ff" + nextAddr.toString(16).padStart(8, "0");
       };
 
-      const browserLocation = () => {
-        const loc = typeof location !== "undefined" && location ? location : null;
-        return {
-          href: loc ? String(loc.href || "about:blank") : "about:blank",
-          pathname: loc ? String(loc.pathname || "/") : "/",
-          hostname: loc ? String(loc.hostname || "localhost") : "localhost",
-          origin: loc ? String(loc.origin || "null") : "null",
-          protocol: loc ? String(loc.protocol || "http:") : "http:",
-          search: loc ? String(loc.search || "") : "",
-          hash: loc ? String(loc.hash || "") : "",
-        };
-      };
+      const browserLocation = () => Object.freeze({
+        href: "https://sandbox.easyjs.local/",
+        pathname: "/",
+        hostname: "sandbox.easyjs.local",
+        origin: "https://sandbox.easyjs.local",
+        protocol: "https:",
+        search: "",
+        hash: "",
+      });
 
       const wrapPtrProxy = (cell) => {
         if (!__ejs_host_Proxy) return cell;
@@ -691,7 +735,11 @@ ${MODULES_STDLIB_SOURCE}
       };
 
       const allocArray = (count, typeName = "T") => {
-        const n = Math.max(0, Math.trunc(Number(count) || 0));
+        const rawNum = Number(count);
+        if (!Number.isFinite(rawNum) || rawNum < 0 || rawNum > 100000) {
+          throw new Error(\`SecurityError: Heap array allocation size (\${count}) exceeds limit (100000)\`);
+        }
+        const n = Math.trunc(rawNum);
         const fill = ["int", "float", "number", "double", "long", "short"].includes(typeName)
           ? 0
           : ["str", "string", "text"].includes(typeName)

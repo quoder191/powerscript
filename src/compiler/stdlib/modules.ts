@@ -1,23 +1,34 @@
 export const MODULES_STDLIB_SOURCE = `
-  const DB_PREFIX = "easyjs_db:";
+  const BLOCKED_MOD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+  const MAX_DB_TABLES = 32;
+  const MAX_DB_ROWS = 1000;
+  const MAX_ROUTES = 64;
+  const MAX_VISUALS = 50;
   const memoryDb = new Map();
 
+  const assertSafeModKey = (raw) => {
+    const key = String(raw ?? "");
+    if (!key || BLOCKED_MOD_KEYS.has(key) || key.length > 128) {
+      throw new Error(\`SecurityError: Unsafe identifier '\${key}' is blocked in sandbox\`);
+    }
+    return key;
+  };
+
+  const cloneSafeRecord = (rec) => {
+    if (typeof rec !== "object" || rec === null) return { value: rec };
+    const out = {};
+    for (const [k, v] of Object.entries(rec)) {
+      if (BLOCKED_MOD_KEYS.has(k)) continue;
+      out[k] = v;
+    }
+    return out;
+  };
+
   const loadDbTable = (table) => {
-    const key = String(table);
+    const key = assertSafeModKey(table);
     if (memoryDb.has(key)) return memoryDb.get(key);
-    if (!(ioHandler && ioHandler.sandboxed) && typeof localStorage !== "undefined") {
-      try {
-        const raw = localStorage.getItem(DB_PREFIX + key);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            memoryDb.set(key, parsed);
-            return parsed;
-          }
-        }
-      } catch {
-        // Ignore storage errors
-      }
+    if (memoryDb.size >= MAX_DB_TABLES) {
+      throw new Error(\`SecurityError: DB table limit (\${MAX_DB_TABLES}) exceeded\`);
     }
     const empty = [];
     memoryDb.set(key, empty);
@@ -25,21 +36,17 @@ export const MODULES_STDLIB_SOURCE = `
   };
 
   const persistDbTable = (table, rows) => {
-    const key = String(table);
+    const key = assertSafeModKey(table);
     memoryDb.set(key, rows);
-    if (!(ioHandler && ioHandler.sandboxed) && typeof localStorage !== "undefined") {
-      try {
-        localStorage.setItem(DB_PREFIX + key, JSON.stringify(rows));
-      } catch {
-        // Ignore storage quota errors
-      }
-    }
   };
 
   const dbLib = Object.freeze({
     save: (table, record) => {
       const rows = loadDbTable(table);
-      const copy = typeof record === "object" && record !== null ? { ...record } : { value: record };
+      if (rows.length >= MAX_DB_ROWS) {
+        throw new Error(\`SecurityError: DB table row limit (\${MAX_DB_ROWS}) exceeded\`);
+      }
+      const copy = cloneSafeRecord(record);
       if (copy.id === undefined) {
         copy.id = rows.length + 1;
       }
@@ -54,7 +61,7 @@ export const MODULES_STDLIB_SOURCE = `
       if (queryOrFn === undefined) return rows.map((r) => ({ ...r }));
       if (typeof queryOrFn === "function") return rows.filter(queryOrFn).map((r) => ({ ...r }));
       if (typeof queryOrFn === "object" && queryOrFn !== null) {
-        const entries = Object.entries(queryOrFn);
+        const entries = Object.entries(queryOrFn).filter(([k]) => !BLOCKED_MOD_KEYS.has(k));
         return rows.filter((r) => entries.every(([k, v]) => r[k] === v)).map((r) => ({ ...r }));
       }
       return rows.filter((r) => r.id === queryOrFn).map((r) => ({ ...r }));
@@ -64,7 +71,7 @@ export const MODULES_STDLIB_SOURCE = `
       const rows = loadDbTable(table);
       const idx = rows.findIndex((r) => r.id === id);
       if (idx === -1) return null;
-      rows[idx] = { ...rows[idx], ...(patch || {}) };
+      rows[idx] = { ...rows[idx], ...cloneSafeRecord(patch) };
       persistDbTable(table, rows);
       return { ...rows[idx] };
     },
@@ -82,19 +89,22 @@ export const MODULES_STDLIB_SOURCE = `
   });
 
   const registeredRoutes = [];
+  const registerRouteSafe = (method, path, handler) => {
+    if (registeredRoutes.length >= MAX_ROUTES) {
+      throw new Error(\`SecurityError: Maximum registered routes (\${MAX_ROUTES}) exceeded\`);
+    }
+    const cleanPath = String(path ?? "");
+    if (!cleanPath.startsWith("/") || cleanPath.length > 256) {
+      throw new Error("SecurityError: Server route path must start with '/' and be <= 256 chars");
+    }
+    registeredRoutes.push({ method: String(method).toUpperCase(), path: cleanPath, handler });
+    return true;
+  };
+
   const serverLib = Object.freeze({
-    get: (path, handler) => {
-      registeredRoutes.push({ method: "GET", path: String(path), handler });
-      return true;
-    },
-    post: (path, handler) => {
-      registeredRoutes.push({ method: "POST", path: String(path), handler });
-      return true;
-    },
-    route: (method, path, handler) => {
-      registeredRoutes.push({ method: String(method).toUpperCase(), path: String(path), handler });
-      return true;
-    },
+    get: (path, handler) => registerRouteSafe("GET", path, handler),
+    post: (path, handler) => registerRouteSafe("POST", path, handler),
+    route: (method, path, handler) => registerRouteSafe(method, path, handler),
     request: (method, path, body = null) => {
       const m = String(method).toUpperCase();
       const p = String(path);
@@ -126,6 +136,9 @@ export const MODULES_STDLIB_SOURCE = `
 
   const visualOutputs = [];
   const emitVisual = (item) => {
+    if (visualOutputs.length >= MAX_VISUALS) {
+      throw new Error(\`SecurityError: Visual output quota (\${MAX_VISUALS}) exceeded\`);
+    }
     visualOutputs.push(item);
     if (ioHandler && typeof ioHandler.onVisual === "function") {
       ioHandler.onVisual(item);
@@ -134,26 +147,26 @@ export const MODULES_STDLIB_SOURCE = `
   };
 
   const uiLib = Object.freeze({
-    html: (markup) => emitVisual({ kind: "html", content: String(markup ?? "") }),
+    html: (markup) => emitVisual({ kind: "html", content: sanitizeYourGuiHtml(markup) }),
     card: (title, body, footer = "") =>
       emitVisual({ kind: "card", title: formatVal(title), body: formatVal(body), footer: footer ? formatVal(footer) : "" }),
     table: (rows = [], columns = undefined) => {
-      const safeRows = Array.isArray(rows) ? rows : [];
+      const safeRows = Array.isArray(rows) ? rows.slice(0, 500) : [];
       const cols = Array.isArray(columns)
-        ? columns
+        ? columns.slice(0, 50)
         : safeRows.length > 0 && typeof safeRows[0] === "object" && safeRows[0] !== null
-          ? Object.keys(safeRows[0])
+          ? Object.keys(safeRows[0]).slice(0, 50)
           : ["value"];
       return emitVisual({ kind: "table", columns: cols, rows: safeRows });
     },
     chart: (title, data = [], chartType = "bar") => {
       const items = Array.isArray(data)
-        ? data.map((d, i) =>
+        ? data.slice(0, 200).map((d, i) =>
             typeof d === "object" && d !== null
               ? { label: String(d.label ?? d.name ?? \`Item \${i + 1}\`), value: Number(d.value ?? d.y ?? 0) }
               : { label: \`#\${i + 1}\`, value: Number(d) }
           )
-        : Object.entries(data || {}).map(([k, v]) => ({ label: String(k), value: Number(v) }));
+        : Object.entries(data || {}).slice(0, 200).map(([k, v]) => ({ label: String(k), value: Number(v) }));
       return emitVisual({ kind: "chart", title: formatVal(title), chartType: String(chartType), data: items });
     },
     clear: () => {

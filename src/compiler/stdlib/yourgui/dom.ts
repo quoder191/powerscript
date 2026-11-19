@@ -75,7 +75,12 @@ export const YOURGUI_DOM_SOURCE = `
       }
     };
 
+    const MAX_GUI_NODES = 1000;
     const makeGuiElement = (tag, textValue = undefined) => {
+      if (nodeRegistry.size >= MAX_GUI_NODES) {
+        throw new Error("SecurityError: yourgui DOM node quota (" + MAX_GUI_NODES + ") exceeded");
+      }
+      const safeTag = /^[a-z0-9]+$/i.test(String(tag || "")) ? String(tag).toLowerCase() : "div";
       const id = "el_" + (nextId++);
       const attrs = {};
       const styleObj = {};
@@ -87,20 +92,24 @@ export const YOURGUI_DOM_SOURCE = `
       let htmlContent = undefined;
       let prevDisplay = "";
       let customId = "";
-      let domEl = useNativeDom ? document.createElement(tag) : null;
+      let domEl = useNativeDom ? document.createElement(safeTag) : null;
       if (domEl && textContent) domEl.textContent = textContent;
 
       const __GuiProxy = typeof __ejs_host_Proxy === "function" ? __ejs_host_Proxy : (typeof Proxy === "function" ? Proxy : null);
       const styleProxy = __GuiProxy ? new __GuiProxy(styleObj, {
         set(target, prop, val) {
           const key = String(prop);
-          target[key] = val === null || val === undefined ? "" : String(val);
-          if (domEl) domEl.style[key] = target[key];
+          if (key === "__proto__" || key === "constructor" || key === "prototype" || !/^[a-zA-Z-]+$/.test(key)) {
+            return true;
+          }
+          const safeVal = sanitizeYourGuiStyleValue(val);
+          target[key] = safeVal;
+          if (domEl) domEl.style[key] = safeVal;
           requestEmit();
           return true;
         },
         get(target, prop) {
-          return target[String(prop)];
+          return Object.prototype.hasOwnProperty.call(target, String(prop)) ? target[String(prop)] : undefined;
         },
       }) : styleObj;
 
@@ -159,7 +168,7 @@ export const YOURGUI_DOM_SOURCE = `
         set innerHTML(v) {
           for (const c of children) c._setParent(null);
           children.length = 0;
-          const s = v === null || v === undefined ? "" : String(v);
+          const s = v === null || v === undefined ? "" : sanitizeYourGuiHtml(v);
           htmlContent = s;
           textContent = s.replace(/<[^>]*>/g, "");
           if (domEl) domEl.innerHTML = s;
@@ -194,14 +203,14 @@ export const YOURGUI_DOM_SOURCE = `
 
         get href() { return String(attrs.href ?? ""); },
         set href(v) {
-          attrs.href = String(v ?? "#");
+          attrs.href = sanitizeYourGuiUrl(v, false) || "#";
           if (domEl && "href" in domEl) domEl.href = attrs.href;
           requestEmit();
         },
 
         get src() { return String(attrs.src ?? ""); },
         set src(v) {
-          attrs.src = String(v ?? "");
+          attrs.src = sanitizeYourGuiUrl(v, true);
           if (domEl && "src" in domEl) domEl.src = attrs.src;
           requestEmit();
         },
@@ -320,8 +329,11 @@ export const YOURGUI_DOM_SOURCE = `
         setStyle(styleMap) {
           if (styleMap && typeof styleMap === "object") {
             for (const [k, v] of Object.entries(styleMap)) {
-              styleObj[k] = v === null || v === undefined ? "" : String(v);
-              if (domEl) domEl.style[k] = styleObj[k];
+              const key = String(k);
+              if (key === "__proto__" || key === "constructor" || key === "prototype" || !/^[a-zA-Z-]+$/.test(key)) continue;
+              const safeVal = sanitizeYourGuiStyleValue(v);
+              styleObj[key] = safeVal;
+              if (domEl) domEl.style[key] = safeVal;
             }
             requestEmit();
           }
@@ -330,11 +342,11 @@ export const YOURGUI_DOM_SOURCE = `
 
         setColor(fg, bg = undefined) {
           if (fg !== undefined && fg !== null) {
-            styleObj.color = String(fg);
+            styleObj.color = sanitizeYourGuiStyleValue(fg);
             if (domEl) domEl.style.color = styleObj.color;
           }
           if (bg !== undefined && bg !== null) {
-            styleObj.backgroundColor = String(bg);
+            styleObj.backgroundColor = sanitizeYourGuiStyleValue(bg);
             if (domEl) domEl.style.backgroundColor = styleObj.backgroundColor;
           }
           requestEmit();
@@ -342,7 +354,7 @@ export const YOURGUI_DOM_SOURCE = `
         },
 
         setBg(bg) {
-          styleObj.backgroundColor = bg === null || bg === undefined ? "" : String(bg);
+          styleObj.backgroundColor = bg === null || bg === undefined ? "" : sanitizeYourGuiStyleValue(bg);
           if (domEl) domEl.style.backgroundColor = styleObj.backgroundColor;
           requestEmit();
           return handle;
@@ -350,12 +362,20 @@ export const YOURGUI_DOM_SOURCE = `
 
         setAttr(k, v) {
           const key = String(k);
+          const lower = key.toLowerCase();
+          if (!isSafeYourGuiAttr(key)) {
+            return handle;
+          }
           if (v === false || v === null || v === undefined) {
             delete attrs[key];
             if (domEl) domEl.removeAttribute(key);
           } else {
-            attrs[key] = v === true ? true : String(v);
-            if (domEl) domEl.setAttribute(key, v === true ? "" : String(v));
+            let safeVal = v === true ? true : String(v);
+            if (safeVal !== true && (lower === "href" || lower === "src" || lower === "poster" || lower === "action")) {
+              safeVal = sanitizeYourGuiUrl(safeVal, lower === "src" || lower === "poster") || "#";
+            }
+            attrs[key] = safeVal;
+            if (domEl) domEl.setAttribute(key, safeVal === true ? "" : safeVal);
           }
           requestEmit();
           return handle;

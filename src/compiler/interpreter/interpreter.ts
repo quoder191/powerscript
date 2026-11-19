@@ -1757,13 +1757,33 @@ export class ASTInterpreter {
     if (typeof obj === 'object') {
       const dict = obj as Record<string, unknown>;
       switch (method) {
-        case 'set': dict[String(args[0])] = args[1]; return dict;
-        case 'get': return Object.prototype.hasOwnProperty.call(dict, String(args[0])) ? dict[String(args[0])] : (args[1] ?? null);
+        case 'set': {
+          const k = String(args[0]);
+          if (this.isBlockedProperty(k)) {
+            throw new Error(`SecurityError: Prototype-polluting key '${k}' is blocked`);
+          }
+          Object.defineProperty(dict, k, {
+            value: args[1],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+          return dict;
+        }
+        case 'get': {
+          const k = String(args[0]);
+          if (this.isBlockedProperty(k)) return args[1] ?? null;
+          return Object.prototype.hasOwnProperty.call(dict, k) ? dict[k] : (args[1] ?? null);
+        }
         case 'has':
-        case 'contains': return Object.prototype.hasOwnProperty.call(dict, String(args[0]));
+        case 'contains': {
+          const k = String(args[0]);
+          return !this.isBlockedProperty(k) && Object.prototype.hasOwnProperty.call(dict, k);
+        }
         case 'remove':
         case 'delete': {
           const k = String(args[0]);
+          if (this.isBlockedProperty(k)) return false;
           const existed = Object.prototype.hasOwnProperty.call(dict, k);
           delete dict[k];
           return existed;
@@ -2028,7 +2048,11 @@ export class ASTInterpreter {
   }
 
   private allocArray(count: number, typeName = 'T'): Record<string, unknown> {
-    const n = Math.max(0, Math.trunc(Number(count) || 0));
+    const rawNum = Number(count);
+    if (!Number.isFinite(rawNum) || rawNum < 0 || rawNum > 100_000) {
+      throw new Error(`SecurityError: Heap array allocation size (${count}) exceeds limit (100000)`);
+    }
+    const n = Math.trunc(rawNum);
     const fill = ['int', 'float', 'number', 'double', 'long', 'short'].includes(typeName)
       ? 0
       : ['str', 'string', 'text'].includes(typeName)
@@ -2495,7 +2519,17 @@ export class ASTInterpreter {
     def('inputInt', async (p = '') => Number.parseInt((await readInputRaw(String(p))).trim(), 10));
     def('inputFloat', async (p = '') => Number.parseFloat((await readInputRaw(String(p))).trim()));
     def('browser', (url: unknown) => {
-      const target = String(url ?? '');
+      const raw = String(url ?? '').trim();
+      let parsed: URL;
+      try {
+        parsed = new URL(raw);
+      } catch {
+        throw new Error(`SecurityError: Invalid browser URL '${raw}'`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`SecurityError: Blocked browser URL protocol '${parsed.protocol}'`);
+      }
+      const target = parsed.toString();
       this.options.onBrowser ? this.options.onBrowser(target) : this.emitLog(`[browser] ${target}`);
       return target;
     });
@@ -2579,8 +2613,17 @@ export class ASTInterpreter {
     def('avg', (arr: number[]) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0));
     def('take', (arr: unknown[], n: number) => arr.slice(0, n));
     def('range', (start: number, end: number, inc = false) => {
+      const s = Number(start);
+      const e = Number(end);
+      if (!Number.isFinite(s) || !Number.isFinite(e)) {
+        throw new Error('SecurityError: range() bounds must be finite numbers');
+      }
+      const limit = inc ? e + 1 : e;
+      if (limit - s > 100_000) {
+        throw new Error('SecurityError: range() size exceeds maximum limit (100000)');
+      }
       const out: number[] = [];
-      for (let i = start; i < (inc ? end + 1 : end); i++) out.push(i);
+      for (let i = s; i < limit; i++) out.push(i);
       return out;
     });
 
@@ -2625,79 +2668,217 @@ export class ASTInterpreter {
     def('formatCurrency', (n: number, sym = '$') => `${sym}${Number(n).toFixed(2)}`);
     def('percent', (p: number, t: number) => (t === 0 ? '0%' : `${((p / t) * 100).toFixed(1)}%`));
 
-    // System & Filesystem (35-46)
-    def('sleep', (ms = 100) => new Promise((resolve) => {
-      const id = setTimeout(() => { this.activeTimeouts.delete(id); resolve(true); }, ms);
-      this.activeTimeouts.add(id);
-    }));
+    // System & Filesystem (strict chroot /sandbox VFS & bounded timers)
+    const MAX_VFS_FILES = 64;
+    const MAX_VFS_FILE_BYTES = 131_072;
+    const MAX_VFS_TOTAL_BYTES = 524_288;
+    const MAX_ACTIVE_TIMERS = 32;
+    const MAX_TIMER_DELAY_MS = 60_000;
+
+    const sanitizeDelay = (rawMs: unknown, minMs = 0): number => {
+      const n = Number(rawMs);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error('SecurityError: Timer/sleep delay must be a non-negative finite number');
+      }
+      return Math.min(MAX_TIMER_DELAY_MS, Math.max(minMs, Math.trunc(n)));
+    };
+
+    const normalizeVfsPath = (rawPath: unknown): string => {
+      const input = String(rawPath ?? '');
+      if (!input || input.length > 256 || /[\u0000-\u001f\u007f]/.test(input)) {
+        throw new Error('SecurityError: Invalid VFS file path');
+      }
+      const normalized = input.replace(/\\/g, '/').trim();
+      if (!normalized) throw new Error('SecurityError: Invalid empty VFS path');
+      const trimmedLeading = normalized.replace(/^\/+/, '');
+      const rel =
+        trimmedLeading === 'sandbox'
+          ? ''
+          : trimmedLeading.startsWith('sandbox/')
+            ? trimmedLeading.slice('sandbox/'.length)
+            : trimmedLeading;
+      const parts = rel.split('/').filter(Boolean);
+      const resolved: string[] = [];
+      for (const seg of parts) {
+        if (seg === '.') continue;
+        if (seg === '..') {
+          if (resolved.length === 0) {
+            throw new Error("SecurityError: VFS path traversal outside '/sandbox' is blocked");
+          }
+          resolved.pop();
+          continue;
+        }
+        if (this.isBlockedProperty(seg)) {
+          throw new Error(`SecurityError: Reserved VFS segment '${seg}' is blocked`);
+        }
+        resolved.push(seg);
+      }
+      if (resolved.length === 0) {
+        throw new Error("SecurityError: VFS path must reference a file inside '/sandbox'");
+      }
+      return '/sandbox/' + resolved.join('/');
+    };
+
+    const totalVfsBytes = (): number => {
+      let total = 0;
+      for (const v of this.memoryVfs.values()) total += v.length;
+      return total;
+    };
+
+    def('sleep', (ms = 100) => {
+      const safeMs = sanitizeDelay(ms, 0);
+      if (this.activeTimeouts.size + this.activeIntervals.size >= MAX_ACTIVE_TIMERS) {
+        return Promise.reject(new Error(`SecurityError: Maximum active timers (${MAX_ACTIVE_TIMERS}) exceeded`));
+      }
+      return new Promise((resolve) => {
+        const id = setTimeout(() => { this.activeTimeouts.delete(id); resolve(true); }, safeMs);
+        this.activeTimeouts.add(id);
+      });
+    });
     def('time', () => {
       const d = new Date();
       return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
     });
     def('date', () => new Date().toISOString().slice(0, 10));
     def('timer', (sec: number, cb?: unknown) => {
-      const ms = sec > 60 ? sec : sec * 1000;
+      const rawMs = Number(sec) > 60 ? Number(sec) : Number(sec) * 1000;
+      const ms = sanitizeDelay(rawMs, 0);
+      if (this.activeTimeouts.size + this.activeIntervals.size >= MAX_ACTIVE_TIMERS) {
+        throw new Error(`SecurityError: Maximum active timers (${MAX_ACTIVE_TIMERS}) exceeded`);
+      }
       if (cb) {
         const id = setTimeout(() => { this.activeTimeouts.delete(id); void this.invokeCallableValue(cb, [], 0); }, ms);
         this.activeTimeouts.add(id);
         return { cancel: () => { clearTimeout(id); this.activeTimeouts.delete(id); } };
       }
-      return new Promise((r) => setTimeout(() => r(true), ms));
+      return new Promise((resolve) => {
+        const id = setTimeout(() => { this.activeTimeouts.delete(id); resolve(true); }, ms);
+        this.activeTimeouts.add(id);
+      });
     });
     def('interval', (ms: number, cb?: unknown) => {
+      const safeMs = sanitizeDelay(ms, 10);
       if (!cb) return { stop: () => {} };
-      const id = setInterval(() => { void this.invokeCallableValue(cb, [], 0); }, ms);
+      if (this.activeTimeouts.size + this.activeIntervals.size >= MAX_ACTIVE_TIMERS) {
+        throw new Error(`SecurityError: Maximum active timers (${MAX_ACTIVE_TIMERS}) exceeded`);
+      }
+      const id = setInterval(() => { void this.invokeCallableValue(cb, [], 0); }, safeMs);
       this.activeIntervals.add(id);
       return { stop: () => { clearInterval(id); this.activeIntervals.delete(id); } };
     });
     def('stop', () => { this.cleanupTimers(); throw new ExitSignal('Stopped by stop()'); });
     def('exit', () => { this.cleanupTimers(); throw new ExitSignal('Exited by exit()'); });
     def('readFile', (p: unknown) => {
-      const k = String(p);
+      const k = normalizeVfsPath(p);
       if (this.memoryVfs.has(k)) return this.memoryVfs.get(k);
       throw new Error(`FileNotFoundError: '${k}' does not exist`);
     });
     def('writeFile', (p: unknown, c: unknown = '') => {
-      const k = String(p);
+      const k = normalizeVfsPath(p);
       const data = formatVal(c);
+      if (data.length > MAX_VFS_FILE_BYTES) {
+        throw new Error(`SecurityError: VFS file size exceeds limit (${MAX_VFS_FILE_BYTES} chars)`);
+      }
+      if (!this.memoryVfs.has(k) && this.memoryVfs.size >= MAX_VFS_FILES) {
+        throw new Error(`SecurityError: VFS file count limit (${MAX_VFS_FILES}) exceeded`);
+      }
+      const prev = this.memoryVfs.has(k) ? this.memoryVfs.get(k)!.length : 0;
+      if (totalVfsBytes() - prev + data.length > MAX_VFS_TOTAL_BYTES) {
+        throw new Error(`SecurityError: VFS total storage quota (${MAX_VFS_TOTAL_BYTES} chars) exceeded`);
+      }
       this.memoryVfs.set(k, data);
       return true;
     });
     def('deleteFile', (p: unknown) => {
-      const k = String(p);
+      const k = normalizeVfsPath(p);
       return this.memoryVfs.delete(k);
     });
     def('download', (name: unknown, content: unknown = '') => {
-      this.emitLog(`[download] ${String(name)} (${formatVal(content).length} bytes)`);
+      const rawBase = String(name ?? 'download.txt').replace(/\\/g, '/').split('/').pop() || 'download.txt';
+      const safeName = rawBase.replace(/^\.+/, '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'download.txt';
+      this.emitLog(`[download] ${safeName} (${formatVal(content).length} bytes)`);
       return true;
     });
 
     // Data Structures & Stack Library
     def('Stack', (init: unknown[] = []) => new EjsStack(init));
     def('Queue', (init: unknown[] = []) => new EjsQueue(init));
-    def('Dict', (init: Record<string, unknown> = {}) => ({ ...init }));
+    def('Dict', (init: Record<string, unknown> = {}) => {
+      const out: Record<string, unknown> = {};
+      if (init && typeof init === 'object') {
+        for (const [k, v] of Object.entries(init)) {
+          if (!this.isBlockedProperty(k)) out[k] = v;
+        }
+      }
+      return out;
+    });
     def('List', (...items: unknown[]) => (items.length === 1 && Array.isArray(items[0]) ? [...items[0]] : items));
     def('Set', (init: unknown[] = []) => new Set(init));
     def('stack', {
       array: (...items: unknown[]) => (items.length === 1 && Array.isArray(items[0]) ? [...items[0]] : items),
-      list: (count = 0, fill: unknown = null) => Array.from({ length: count }, (_, i) => (typeof fill === 'function' ? fill(i) : fill)),
+      list: (count = 0, fill: unknown = null) => {
+        const n = Number(count);
+        if (!Number.isFinite(n) || n < 0 || n > 100_000) {
+          throw new Error(`SecurityError: stack.list size (${count}) exceeds limit (100000)`);
+        }
+        return Array.from({ length: Math.trunc(n) }, (_, i) => (typeof fill === 'function' ? fill(i) : fill));
+      },
       dict: (a?: unknown, b?: unknown) => {
         if (Array.isArray(a) && Array.isArray(b)) {
           const obj: Record<string, unknown> = {};
-          for (let i = 0; i < Math.min(a.length, b.length); i++) obj[String(a[i])] = b[i];
+          for (let i = 0; i < Math.min(a.length, b.length); i++) {
+            const k = String(a[i]);
+            if (this.isBlockedProperty(k)) {
+              throw new Error(`SecurityError: Prototype-polluting key '${k}' is blocked`);
+            }
+            obj[k] = b[i];
+          }
           return obj;
         }
-        return typeof a === 'object' && a ? { ...(a as object) } : {};
+        const out: Record<string, unknown> = {};
+        if (typeof a === 'object' && a) {
+          for (const [k, v] of Object.entries(a as Record<string, unknown>)) {
+            if (!this.isBlockedProperty(k)) out[k] = v;
+          }
+        }
+        return out;
       },
       zip: (k: unknown[], v: unknown[]) => {
         const obj: Record<string, unknown> = {};
-        for (let i = 0; i < Math.min(k.length, v.length); i++) obj[String(k[i])] = v[i];
+        for (let i = 0; i < Math.min(k.length, v.length); i++) {
+          const key = String(k[i]);
+          if (this.isBlockedProperty(key)) {
+            throw new Error(`SecurityError: Prototype-polluting key '${key}' is blocked`);
+          }
+          obj[key] = v[i];
+        }
         return obj;
       },
-      merge: (...dicts: object[]) => Object.assign({}, ...dicts),
+      merge: (...dicts: object[]) => {
+        const out: Record<string, unknown> = {};
+        for (const d of dicts) {
+          if (!d || typeof d !== 'object') continue;
+          for (const [k, v] of Object.entries(d as Record<string, unknown>)) {
+            if (this.isBlockedProperty(k)) {
+              throw new Error(`SecurityError: Prototype-polluting key '${k}' is blocked`);
+            }
+            out[k] = v;
+          }
+        }
+        return out;
+      },
       range: (s: number, e: number, step = 1) => {
+        const st = Number(step);
+        if (!Number.isFinite(st) || st === 0 || !Number.isFinite(s) || !Number.isFinite(e)) {
+          throw new Error('SecurityError: stack.range() requires finite bounds and non-zero step');
+        }
         const out: number[] = [];
-        for (let i = s; step > 0 ? i < e : i > e; i += step) out.push(i);
+        for (let i = s; st > 0 ? i < e : i > e; i += st) {
+          if (out.length >= 100_000) {
+            throw new Error('SecurityError: stack.range() exceeds maximum size limit (100000)');
+          }
+          out.push(i);
+        }
         return out;
       },
       lifo: (init: unknown[] = []) => new EjsStack(init),

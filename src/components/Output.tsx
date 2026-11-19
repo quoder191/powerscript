@@ -323,14 +323,29 @@ function VisualRenderer({
     );
   }
 
+  const safeHtmlContent = useMemo(() => sanitizeStaticHtmlForSandbox(item.content), [item.content]);
+
   return (
     <iframe
       title="EasyJS Visual HTML Output"
       sandbox=""
-      srcDoc={item.content}
+      referrerPolicy="no-referrer"
+      srcDoc={safeHtmlContent}
       className="w-full h-56 bg-white rounded-md border border-slate-200 dark:border-slate-800 shrink-0"
     />
   );
+}
+
+const STATIC_HTML_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; img-src https: http:; object-src 'none'; base-uri 'none'; form-action 'none';";
+
+function sanitizeStaticHtmlForSandbox(raw: string): string {
+  const cleaned = String(raw ?? '')
+    .replace(/<\s*(script|iframe|object|embed|svg|math|meta|base|link)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
+    .replace(/<\s*(script|iframe|object|embed|svg|math|meta|base|link)\b[^>]*\/?>/gi, '')
+    .replace(/\son[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(?:javascript|vbscript)\s*:/gi, 'blocked:');
+  return `<!doctype html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="${STATIC_HTML_CSP}" /></head><body>${cleaned}</body></html>`;
 }
 
 function countGuiNodes(nodes: GuiVNodeSnapshot[]): number {
@@ -341,12 +356,24 @@ function countGuiNodes(nodes: GuiVNodeSnapshot[]): number {
   return count;
 }
 
-function buildYourGuiIframeSrcDoc(pageId: string): string {
-  const bootstrapData = JSON.stringify({ pageId });
+function createFrameToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const buf = new Uint8Array(16);
+    crypto.getRandomValues(buf);
+    return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return 'ygf_' + Math.random().toString(36).slice(2) + '_' + Date.now();
+}
+
+export function buildYourGuiIframeSrcDoc(pageId: string, frameToken = ''): string {
+  const bootstrapData = JSON.stringify({ pageId, frameToken });
+  const previewCsp =
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: http: data:; media-src https: http:; font-src https: http: data:; object-src 'none'; base-uri 'none'; form-action 'none';";
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="${previewCsp}" />
 <style id="yourgui-base-css">
   * { box-sizing: border-box; }
   body {
@@ -399,17 +426,139 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
   const PAGE = ${bootstrapData};
   let latestPayload = null;
 
+  const ALLOWED_TAGS = new Set([
+    'div','span','p','section','article','main','header','footer','nav','aside',
+    'h1','h2','h3','h4','h5','h6','button','input','textarea','select','option','optgroup',
+    'label','form','hr','br','a','img','video','audio','source',
+    'ul','ol','li','table','thead','tbody','tfoot','tr','th','td',
+    'strong','b','em','i','u','s','code','pre','blockquote','small','sub','sup'
+  ]);
+  const DROP_SUBTREE_TAGS = new Set([
+    'script','style','iframe','object','embed','svg','math','meta','base','link','template','noscript'
+  ]);
+  const ALLOWED_ATTRS = new Set([
+    'id','class','type','value','placeholder','name','checked','disabled','readonly','required',
+    'min','max','step','maxlength','minlength','rows','cols','selected','multiple',
+    'alt','title','href','src','poster','target','rel','controls','loop','muted',
+    'autoplay','colspan','rowspan','for','role'
+  ]);
+  const URL_ATTRS = new Set(['href','src','poster']);
+
+  const sanitizeUrl = (raw, allowImageData) => {
+    const val = String(raw || '').trim();
+    if (!val) return '';
+    if (val === '#' || val.startsWith('#') || (val.startsWith('/') && !val.startsWith('//'))) {
+      return val;
+    }
+    const compact = val.replace(/[\\u0000-\\u0020\\u007f]+/g, '');
+    if (/^(javascript|vbscript|file):/i.test(compact)) return '#';
+    if (/^data:/i.test(compact)) {
+      if (allowImageData && /^data:image\\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=]+$/i.test(compact)) {
+        return val;
+      }
+      return '#';
+    }
+    try {
+      const u = new URL(val);
+      if (u.protocol === 'http:' || u.protocol === 'https:') return val;
+    } catch {
+      if (!compact.includes(':')) return val;
+    }
+    return '#';
+  };
+
+  const sanitizeCss = (rawCss) => {
+    return String(rawCss || '')
+      .slice(0, 32768)
+      .replace(/<\\/\\s*style/gi, ' ')
+      .replace(/@import\\b[^;}\\n]*;?/gi, '/* blocked */')
+      .replace(/@charset\\b[^;}\\n]*;?/gi, '')
+      .replace(/expression\\s*\\([^)]*\\)/gi, 'none')
+      .replace(/-moz-binding\\s*:[^;}\\n]*/gi, '')
+      .replace(/behavior\\s*:[^;}\\n]*/gi, '')
+      .replace(/url\\s*\\([^)]*\\)/gi, 'none')
+      .replace(/javascript\\s*:/gi, '')
+      .replace(/vbscript\\s*:/gi, '');
+  };
+
+  const sanitizeStyleVal = (val) => {
+    const s = String(val ?? '').slice(0, 512);
+    if (/expression\\s*\\(|-moz-binding|behavior\\s*:|@import|url\\s*\\(|javascript\\s*:|vbscript\\s*:/i.test(s)) {
+      return '';
+    }
+    return s.replace(/[;{}]/g, ' ').trim();
+  };
+
+  const isAllowedAttr = (attrName) => {
+    const k = String(attrName || '').toLowerCase();
+    if (k.startsWith('on')) return false;
+    if (k === 'data-yg-id') return false;
+    return ALLOWED_ATTRS.has(k) || /^aria-[a-z0-9_-]+$/.test(k) || /^data-[a-z0-9_-]+$/.test(k);
+  };
+
+  const sanitizeElementTree = (srcNode, outDoc) => {
+    if (srcNode.nodeType === 3) {
+      return outDoc.createTextNode(srcNode.textContent || '');
+    }
+    if (srcNode.nodeType !== 1) return null;
+    const tag = String(srcNode.tagName || '').toLowerCase();
+    if (DROP_SUBTREE_TAGS.has(tag)) return null;
+
+    if (!ALLOWED_TAGS.has(tag)) {
+      const frag = outDoc.createDocumentFragment();
+      for (const ch of Array.from(srcNode.childNodes)) {
+        const clean = sanitizeElementTree(ch, outDoc);
+        if (clean) frag.appendChild(clean);
+      }
+      return frag;
+    }
+
+    const cleanEl = outDoc.createElement(tag);
+    for (const attr of Array.from(srcNode.attributes || [])) {
+      const k = String(attr.name || '').toLowerCase();
+      if (!isAllowedAttr(k)) continue;
+      if (URL_ATTRS.has(k)) {
+        const safeUrl = sanitizeUrl(attr.value, k === 'src' || k === 'poster');
+        cleanEl.setAttribute(k, safeUrl || '#');
+      } else {
+        cleanEl.setAttribute(k, attr.value);
+      }
+    }
+    if (tag === 'a' && cleanEl.getAttribute('target') === '_blank') {
+      cleanEl.setAttribute('rel', 'noopener noreferrer');
+    }
+    for (const ch of Array.from(srcNode.childNodes)) {
+      const clean = sanitizeElementTree(ch, outDoc);
+      if (clean) cleanEl.appendChild(clean);
+    }
+    return cleanEl;
+  };
+
   const sanitizeHtml = (raw) => {
-    return String(raw)
-      .replace(/<\\s*script\\b[^>]*>[\\s\\S]*?<\\s*\\/\\s*script\\s*>/gi, '')
-      .replace(/\\son[a-z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '')
-      .replace(/javascript\\s*:/gi, '');
+    const str = String(raw || '').slice(0, 32768);
+    if (typeof DOMParser === 'function') {
+      try {
+        const parsed = new DOMParser().parseFromString(str, 'text/html');
+        const container = document.createElement('div');
+        for (const child of Array.from(parsed.body.childNodes)) {
+          const safeChild = sanitizeElementTree(child, document);
+          if (safeChild) container.appendChild(safeChild);
+        }
+        return container.innerHTML;
+      } catch {
+        // Fallback text escape below
+      }
+    }
+    const fallback = document.createElement('div');
+    fallback.textContent = str;
+    return fallback.innerHTML;
   };
 
   const postEvt = (id, eventType, el) => {
     window.parent.postMessage({
       source: 'yourgui',
       pageId: PAGE.pageId,
+      frameToken: PAGE.frameToken,
       elementId: id,
       eventType,
       value: el && 'value' in el ? el.value : undefined,
@@ -418,22 +567,35 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
   };
 
   const buildNode = (snap) => {
-    const el = document.createElement(snap.tag || 'div');
-    el.setAttribute('data-yg-id', snap.id);
+    const rawTag = String(snap.tag || 'div').toLowerCase();
+    const safeTag = ALLOWED_TAGS.has(rawTag) ? rawTag : 'div';
+    const el = document.createElement(safeTag);
+    el.setAttribute('data-yg-id', String(snap.id || ''));
 
     if (snap.attrs) {
-      for (const [k, v] of Object.entries(snap.attrs)) {
+      for (const [rawKey, v] of Object.entries(snap.attrs)) {
+        const k = String(rawKey).toLowerCase();
         if (k === 'class') { el.className = String(v); }
         else if (k === 'value' && 'value' in el) { el.value = String(v); }
         else if (k === 'checked' && 'checked' in el) { el.checked = Boolean(v); }
+        else if (!isAllowedAttr(k)) { continue; }
+        else if (URL_ATTRS.has(k)) {
+          const safeUrl = sanitizeUrl(String(v ?? ''), k === 'src' || k === 'poster');
+          el.setAttribute(k, safeUrl || '#');
+        }
         else if (v === true) { el.setAttribute(k, ''); }
         else if (v !== false && v !== null && v !== undefined) { el.setAttribute(k, String(v)); }
       }
     }
+    if (safeTag === 'a' && el.getAttribute('target') === '_blank') {
+      el.setAttribute('rel', 'noopener noreferrer');
+    }
 
     if (snap.style) {
       for (const [sk, sv] of Object.entries(snap.style)) {
-        el.style[sk] = sv;
+        if (!/^[a-zA-Z-]+$/.test(sk) || sk === '__proto__' || sk === 'constructor' || sk === 'prototype') continue;
+        const safeSv = sanitizeStyleVal(sv);
+        if (safeSv) el.style[sk] = safeSv;
       }
     }
 
@@ -449,9 +611,9 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
       }
     }
 
-    if (snap.tag === 'button' || snap.tag === 'a') {
+    if (safeTag === 'button' || safeTag === 'a') {
       el.addEventListener('click', (e) => {
-        if (snap.tag === 'a' && (snap.attrs?.href === '#' || !snap.attrs?.href)) e.preventDefault();
+        if (safeTag === 'a' && (snap.attrs?.href === '#' || !snap.attrs?.href)) e.preventDefault();
         postEvt(snap.id, 'click', el);
       });
     } else {
@@ -460,12 +622,12 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
       });
     }
 
-    if (snap.tag === 'input' || snap.tag === 'textarea') {
+    if (safeTag === 'input' || safeTag === 'textarea') {
       el.addEventListener('input', () => postEvt(snap.id, 'input', el));
       el.addEventListener('change', () => postEvt(snap.id, 'change', el));
-    } else if (snap.tag === 'select') {
+    } else if (safeTag === 'select') {
       el.addEventListener('change', () => postEvt(snap.id, 'change', el));
-    } else if (snap.tag === 'form') {
+    } else if (safeTag === 'form') {
       el.addEventListener('submit', (e) => {
         e.preventDefault();
         postEvt(snap.id, 'submit', el);
@@ -481,7 +643,9 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
 
     const styleEl = document.getElementById('yourgui-user-css');
     if (styleEl) {
-      styleEl.textContent = Array.isArray(payload.styles) ? payload.styles.join('\\n\\n') : '';
+      styleEl.textContent = Array.isArray(payload.styles)
+        ? payload.styles.map((css) => sanitizeCss(css)).join('\\n\\n')
+        : '';
     }
 
     const activeEl = document.activeElement;
@@ -496,7 +660,14 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
     }
 
     if (activeId) {
-      const nextActive = document.querySelector('[data-yg-id="' + activeId + '"]');
+      let nextActive = null;
+      const candidates = document.querySelectorAll('[data-yg-id]');
+      for (const candidate of candidates) {
+        if (candidate.getAttribute('data-yg-id') === activeId) {
+          nextActive = candidate;
+          break;
+        }
+      }
       if (nextActive && typeof nextActive.focus === 'function') {
         nextActive.focus();
         if (selStart !== null && selEnd !== null && typeof nextActive.setSelectionRange === 'function') {
@@ -508,12 +679,19 @@ function buildYourGuiIframeSrcDoc(pageId: string): string {
 
   window.addEventListener('message', (event) => {
     const data = event.data;
-    if (!data || data.source !== 'yourgui-host' || data.pageId !== PAGE.pageId) return;
+    if (
+      !data ||
+      data.source !== 'yourgui-host' ||
+      data.pageId !== PAGE.pageId ||
+      data.frameToken !== PAGE.frameToken
+    ) {
+      return;
+    }
     renderSnapshot(data);
   });
 
   window.addEventListener('DOMContentLoaded', () => {
-    window.parent.postMessage({ source: 'yourgui', type: 'ready', pageId: PAGE.pageId }, '*');
+    window.parent.postMessage({ source: 'yourgui', type: 'ready', pageId: PAGE.pageId, frameToken: PAGE.frameToken }, '*');
     if (latestPayload) renderSnapshot(latestPayload);
   });
 })();
@@ -540,7 +718,11 @@ function YourGuiBrowserPreview({
   itemRef.current = item;
   onGuiEventRef.current = onGuiEvent;
 
-  const srcDoc = useMemo(() => buildYourGuiIframeSrcDoc(item.pageId), [item.pageId]);
+  const frameToken = useMemo(() => createFrameToken(), [item.pageId]);
+  const srcDoc = useMemo(
+    () => buildYourGuiIframeSrcDoc(item.pageId, frameToken),
+    [item.pageId, frameToken]
+  );
   const nodeCount = useMemo(() => countGuiNodes(item.nodes), [item.nodes]);
 
   const pushRender = () => {
@@ -551,6 +733,7 @@ function YourGuiBrowserPreview({
       {
         source: 'yourgui-host',
         pageId: current.pageId,
+        frameToken,
         title: current.title,
         styles: current.styles,
         nodes: current.nodes,
@@ -565,21 +748,34 @@ function YourGuiBrowserPreview({
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
+      if (event.source !== iframeRef.current?.contentWindow) return;
       const data = event.data as {
         source?: string;
         type?: string;
         pageId?: string;
+        frameToken?: string;
         elementId?: string;
         eventType?: string;
         value?: string;
         checked?: boolean;
       } | null;
-      if (!data || data.source !== 'yourgui' || data.pageId !== item.pageId) return;
+      if (
+        !data ||
+        data.source !== 'yourgui' ||
+        data.pageId !== item.pageId ||
+        data.frameToken !== frameToken
+      ) {
+        return;
+      }
       if (data.type === 'ready') {
         pushRender();
         return;
       }
-      if (data.elementId && data.eventType && onGuiEventRef.current) {
+      if (
+        typeof data.elementId === 'string' &&
+        typeof data.eventType === 'string' &&
+        onGuiEventRef.current
+      ) {
         onGuiEventRef.current(data.elementId, data.eventType, {
           value: data.value,
           checked: data.checked,
@@ -588,7 +784,7 @@ function YourGuiBrowserPreview({
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [item.pageId]);
+  }, [item.pageId, frameToken]);
 
   return (
     <div className="flex flex-col flex-1 min-h-[320px] rounded-md border border-slate-200 dark:border-slate-800 overflow-hidden bg-white dark:bg-slate-950">
@@ -601,6 +797,7 @@ function YourGuiBrowserPreview({
         ref={iframeRef}
         title={item.title || 'YourGUI Live Website Preview'}
         sandbox="allow-scripts"
+        referrerPolicy="no-referrer"
         srcDoc={srcDoc}
         className="w-full flex-1 min-h-[280px] bg-white border-0"
       />

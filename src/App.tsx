@@ -39,6 +39,7 @@ import {
 import { runGeneratorTests } from '../tests/generator.test.ts';
 import { runLexerTests, type TestCaseResult } from '../tests/lexer.test.ts';
 import { runParserTests } from '../tests/parser.test.ts';
+import { runAdversarialSecurityTests } from '../tests/security.adversarial.test.ts';
 import { runTransformerTests } from '../tests/transformer.test.ts';
 
 const PRESETS: ExamplePreset[] = [
@@ -477,12 +478,16 @@ print(*secretKey)
 ];
 
 async function executeAllTests(): Promise<TestCaseResult[]> {
-  const genResults = await runGeneratorTests();
+  const [genResults, secResults] = await Promise.all([
+    runGeneratorTests(),
+    runAdversarialSecurityTests(),
+  ]);
   return [
     ...runLexerTests(),
     ...runParserTests(),
     ...runTransformerTests(),
     ...genResults,
+    ...secResults,
   ];
 }
 

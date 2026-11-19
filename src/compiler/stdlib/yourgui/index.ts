@@ -1,5 +1,12 @@
 import type { GuiVNodeSnapshot, VisualOutputItem } from '../../utils/helpers.ts';
-import { YOURGUI_CSS_SOURCE } from './css.ts';
+import {
+  isSafeYourGuiAttrName,
+  sanitizeYourGuiCssText,
+  sanitizeYourGuiHtmlString,
+  sanitizeYourGuiStyleValue,
+  sanitizeYourGuiUrl,
+  YOURGUI_CSS_SOURCE,
+} from './css.ts';
 import {
   YOURGUI_ALL_GUI_SYMBOLS,
   YOURGUI_ELEMENT_NAMES,
@@ -155,8 +162,11 @@ export class YourGuiEngine {
   }
 
   public injectCss(cssText: unknown): string {
-    const clean = String(cssText ?? '');
+    const clean = sanitizeYourGuiCssText(cssText);
     if (!clean.trim()) return '';
+    if (this.styles.length >= 64) {
+      throw new Error('SecurityError: CSS stylesheet quota exceeded in yourgui');
+    }
     this.styles.push(clean);
     this.requestEmit();
     return clean;
@@ -248,6 +258,10 @@ export class YourGuiEngine {
   }
 
   private makeElement(tag: string, textValue?: unknown): GuiNodeHandle {
+    if (this.nodeRegistry.size >= 1000) {
+      throw new Error('SecurityError: yourgui DOM node quota (1000) exceeded');
+    }
+    const safeTag = /^[a-z0-9]+$/i.test(String(tag || '')) ? String(tag).toLowerCase() : 'div';
     const id = `el_${this.nextId++}`;
     const attrs: Record<string, string | boolean> = {};
     const styleObj: Record<string, string> = {};
@@ -272,11 +286,20 @@ export class YourGuiEngine {
     const styleProxy = new Proxy(styleObj, {
       set: (target, prop, val) => {
         const key = String(prop);
-        target[key] = val === null || val === undefined ? '' : String(val);
+        if (
+          key === '__proto__' ||
+          key === 'constructor' ||
+          key === 'prototype' ||
+          !/^[a-zA-Z-]+$/.test(key)
+        ) {
+          return true;
+        }
+        target[key] = sanitizeYourGuiStyleValue(val);
         emit();
         return true;
       },
-      get: (target, prop) => target[String(prop)],
+      get: (target, prop) =>
+        Object.prototype.hasOwnProperty.call(target, String(prop)) ? target[String(prop)] : undefined,
     });
 
     const getClasses = () =>
@@ -287,7 +310,7 @@ export class YourGuiEngine {
     const handle: GuiNodeHandle = {
       __isGuiElement: true,
       __guiId: id,
-      __tag: tag,
+      __tag: safeTag,
       style: styleProxy,
 
       get id(): string { return String(attrs.id ?? ''); },
@@ -331,7 +354,7 @@ export class YourGuiEngine {
         const raw: unknown = v;
         for (const c of children) c._setParent(null);
         children.length = 0;
-        const s = raw === null || raw === undefined ? '' : String(raw);
+        const s = raw === null || raw === undefined ? '' : sanitizeYourGuiHtmlString(raw);
         htmlContent = s;
         textContent = s.replace(/<[^>]*>/g, '');
         emit();
@@ -357,10 +380,10 @@ export class YourGuiEngine {
       set placeholder(v: string) { attrs.placeholder = String(v ?? ''); emit(); },
 
       get href(): string { return String(attrs.href ?? ''); },
-      set href(v: string) { attrs.href = String(v ?? '#'); emit(); },
+      set href(v: string) { attrs.href = sanitizeYourGuiUrl(v, false) || '#'; emit(); },
 
       get src(): string { return String(attrs.src ?? ''); },
-      set src(v: string) { attrs.src = String(v ?? ''); emit(); },
+      set src(v: string) { attrs.src = sanitizeYourGuiUrl(v, true); emit(); },
 
       get alt(): string { return String(attrs.alt ?? ''); },
       set alt(v: string) { attrs.alt = String(v ?? ''); emit(); },
@@ -418,7 +441,16 @@ export class YourGuiEngine {
       setStyle: (styleMap: Record<string, unknown>) => {
         if (styleMap && typeof styleMap === 'object') {
           for (const [k, v] of Object.entries(styleMap)) {
-            styleObj[k] = v === null || v === undefined ? '' : String(v);
+            const key = String(k);
+            if (
+              key === '__proto__' ||
+              key === 'constructor' ||
+              key === 'prototype' ||
+              !/^[a-zA-Z-]+$/.test(key)
+            ) {
+              continue;
+            }
+            styleObj[key] = sanitizeYourGuiStyleValue(v);
           }
           emit();
         }
@@ -426,24 +458,32 @@ export class YourGuiEngine {
       },
 
       setColor: (fg: unknown, bg?: unknown) => {
-        if (fg !== undefined && fg !== null) styleObj.color = String(fg);
-        if (bg !== undefined && bg !== null) styleObj.backgroundColor = String(bg);
+        if (fg !== undefined && fg !== null) styleObj.color = sanitizeYourGuiStyleValue(fg);
+        if (bg !== undefined && bg !== null) styleObj.backgroundColor = sanitizeYourGuiStyleValue(bg);
         emit();
         return handle;
       },
 
       setBg: (bg: unknown) => {
-        styleObj.backgroundColor = bg === null || bg === undefined ? '' : String(bg);
+        styleObj.backgroundColor = bg === null || bg === undefined ? '' : sanitizeYourGuiStyleValue(bg);
         emit();
         return handle;
       },
 
       setAttr: (k: string, v: unknown) => {
         const key = String(k);
+        const lower = key.toLowerCase();
+        if (!isSafeYourGuiAttrName(key)) {
+          return handle;
+        }
         if (v === false || v === null || v === undefined) {
           delete attrs[key];
         } else {
-          attrs[key] = v === true ? true : String(v);
+          let safeVal: string | boolean = v === true ? true : String(v);
+          if (safeVal !== true && (lower === 'href' || lower === 'src' || lower === 'poster' || lower === 'action')) {
+            safeVal = sanitizeYourGuiUrl(safeVal, lower === 'src' || lower === 'poster') || '#';
+          }
+          attrs[key] = safeVal;
         }
         emit();
         return handle;
@@ -693,7 +733,7 @@ export class YourGuiEngine {
 
       _toSnapshot: (): GuiVNodeSnapshot => ({
         id,
-        tag,
+        tag: safeTag,
         textContent: children.length === 0 ? textContent : undefined,
         html: children.length === 0 ? htmlContent : undefined,
         attrs: { ...attrs },

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -511,12 +512,214 @@ export async function executeCompiledInWorker(
   }
 }
 
+export type SandboxScope = 'compile' | 'execute' | 'status';
+
+const ALL_SANDBOX_SCOPES: SandboxScope[] = ['compile', 'execute', 'status'];
+const DEFAULT_SESSION_TTL_MS = 15 * 60_000;
+const SESSION_COOKIE_NAME = 'ps_session';
+const SESSION_RATE_MAX_PER_WINDOW = 60;
+
+interface SignedSessionPayload {
+  sub: string;
+  scopes: SandboxScope[];
+  iat: number;
+  exp: number;
+  jti: string;
+  ip: string;
+}
+
+function normalizeClientIp(rawIp: string): string {
+  let clean = rawIp.trim();
+  if (clean.startsWith('::ffff:')) {
+    clean = clean.slice('::ffff:'.length);
+  }
+  if (clean === '::1') {
+    clean = '127.0.0.1';
+  }
+  return clean;
+}
+
+function base64UrlEncode(input: string | Buffer): string {
+  return Buffer.from(input).toString('base64url');
+}
+
+function base64UrlDecodeToUtf8(input: string): string {
+  return Buffer.from(input, 'base64url').toString('utf8');
+}
+
+export function signSandboxSessionToken(options: {
+  secret: string;
+  scopes: SandboxScope[];
+  clientIp?: string;
+  ttlMs?: number;
+}): { token: string; expiresAt: number } {
+  const now = Date.now();
+  const ttlMs = clampFiniteInt(options.ttlMs, DEFAULT_SESSION_TTL_MS, 50, 24 * 3600_000);
+  const expiresAt = now + ttlMs;
+  const payload: SignedSessionPayload = {
+    sub: 'sandbox-client',
+    scopes: options.scopes.filter((s): s is SandboxScope =>
+      s === 'compile' || s === 'execute' || s === 'status'
+    ),
+    iat: now,
+    exp: expiresAt,
+    jti: randomBytes(12).toString('hex'),
+    ip: normalizeClientIp(options.clientIp ?? '127.0.0.1'),
+  };
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const sig = createHmac('sha256', options.secret).update(encodedPayload).digest('base64url');
+  return {
+    token: `${encodedPayload}.${sig}`,
+    expiresAt,
+  };
+}
+
+function verifySandboxSessionToken(
+  token: string,
+  secret: string,
+  expectedIp: string,
+  enforceIpBinding: boolean
+): { valid: true; payload: SignedSessionPayload } | { valid: false; reason: string } {
+  if (!token || token.length > 2048) {
+    return { valid: false, reason: 'Invalid session token format.' };
+  }
+  const dotIdx = token.indexOf('.');
+  if (dotIdx <= 0 || dotIdx === token.length - 1 || token.indexOf('.', dotIdx + 1) !== -1) {
+    return { valid: false, reason: 'Malformed session token.' };
+  }
+  const encodedPayload = token.slice(0, dotIdx);
+  const providedSig = token.slice(dotIdx + 1);
+  const expectedSig = createHmac('sha256', secret).update(encodedPayload).digest('base64url');
+
+  const providedBuf = Buffer.from(providedSig, 'utf8');
+  const expectedBuf = Buffer.from(expectedSig, 'utf8');
+  if (providedBuf.length !== expectedBuf.length || !timingSafeEqual(providedBuf, expectedBuf)) {
+    return { valid: false, reason: 'Invalid session token signature.' };
+  }
+
+  let parsed: SignedSessionPayload;
+  try {
+    parsed = JSON.parse(base64UrlDecodeToUtf8(encodedPayload)) as SignedSessionPayload;
+  } catch {
+    return { valid: false, reason: 'Corrupted session token payload.' };
+  }
+
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    !Array.isArray(parsed.scopes) ||
+    typeof parsed.exp !== 'number' ||
+    typeof parsed.iat !== 'number' ||
+    typeof parsed.ip !== 'string'
+  ) {
+    return { valid: false, reason: 'Invalid session token claims.' };
+  }
+
+  if (Date.now() > parsed.exp) {
+    return { valid: false, reason: 'Session token expired.' };
+  }
+
+  if (enforceIpBinding) {
+    const reqIp = normalizeClientIp(expectedIp);
+    const tokenIp = normalizeClientIp(parsed.ip);
+    if (reqIp !== tokenIp) {
+      return { valid: false, reason: 'Session token IP mismatch.' };
+    }
+  }
+
+  return { valid: true, payload: parsed };
+}
+
+function constantTimeEqualsSecret(candidate: string, expected: string): boolean {
+  if (!candidate || !expected) return false;
+  const candidateDigest = createHash('sha256').update(candidate).digest();
+  const expectedDigest = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(candidateDigest, expectedDigest);
+}
+
+function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader || typeof cookieHeader !== 'string') return null;
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    if (key === name) {
+      try {
+        return decodeURIComponent(part.slice(eq + 1).trim());
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function isSameOriginHeaderValid(req: Request): { ok: true } | { ok: false; reason: string } {
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (typeof secFetchSite === 'string' && secFetchSite.toLowerCase() === 'cross-site') {
+    return { ok: false, reason: 'Forbidden: cross-site request blocked by CSRF policy.' };
+  }
+
+  const allowedHosts = new Set<string>();
+  if (typeof req.headers.host === 'string' && req.headers.host.trim()) {
+    allowedHosts.add(req.headers.host.trim().toLowerCase());
+  }
+  const forwardedHost = req.headers['x-forwarded-host'];
+  if (typeof forwardedHost === 'string' && forwardedHost.trim()) {
+    const first = forwardedHost.split(',')[0]?.trim().toLowerCase();
+    if (first) allowedHosts.add(first);
+  }
+
+  const originHeader = req.headers.origin;
+  if (typeof originHeader === 'string') {
+    if (!originHeader || originHeader === 'null') {
+      return { ok: false, reason: 'Forbidden: null/opaque Origin rejected.' };
+    }
+    try {
+      const parsedOrigin = new URL(originHeader);
+      if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') {
+        return { ok: false, reason: 'Forbidden: unsupported Origin scheme.' };
+      }
+      if (!allowedHosts.has(parsedOrigin.host.toLowerCase())) {
+        return { ok: false, reason: 'Forbidden: cross-origin request rejected.' };
+      }
+    } catch {
+      return { ok: false, reason: 'Forbidden: malformed Origin header.' };
+    }
+    return { ok: true };
+  }
+
+  const refererHeader = req.headers.referer;
+  if (typeof refererHeader === 'string' && refererHeader.trim()) {
+    try {
+      const parsedReferer = new URL(refererHeader);
+      if (!allowedHosts.has(parsedReferer.host.toLowerCase())) {
+        return { ok: false, reason: 'Forbidden: cross-origin Referer rejected.' };
+      }
+    } catch {
+      return { ok: false, reason: 'Forbidden: malformed Referer header.' };
+    }
+  }
+
+  return { ok: true };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 export interface SandboxServerAppOptions {
   executeRateLimitPerMin?: number;
   compileRateLimitPerMin?: number;
+  sessionRateLimitPerMin?: number;
   maxConcurrentWorkers?: number;
   maxPendingQueue?: number;
   maxQueueWaitMs?: number;
+  sessionSecret?: string;
+  sessionTtlMs?: number;
+  apiKey?: string;
+  enforceIpBinding?: boolean;
 }
 
 export function createSandboxServerApp(options: SandboxServerAppOptions = {}): Express {
@@ -532,6 +735,19 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
         )
       : defaultWorkerPool;
 
+  const sessionSecret =
+    options.sessionSecret ??
+    process.env.POWERSCRIPT_SESSION_SECRET ??
+    randomBytes(32).toString('hex');
+  const configuredApiKey = options.apiKey ?? process.env.POWERSCRIPT_API_KEY ?? '';
+  const sessionTtlMs = clampFiniteInt(
+    options.sessionTtlMs,
+    DEFAULT_SESSION_TTL_MS,
+    50,
+    24 * 3600_000
+  );
+  const enforceIpBinding = options.enforceIpBinding ?? true;
+
   const executeLimiter = new SlidingWindowRateLimiter(
     RATE_WINDOW_MS,
     options.executeRateLimitPerMin ?? EXECUTE_MAX_REQ_PER_WINDOW
@@ -540,6 +756,93 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     RATE_WINDOW_MS,
     options.compileRateLimitPerMin ?? COMPILE_MAX_REQ_PER_WINDOW
   );
+  const sessionLimiter = new SlidingWindowRateLimiter(
+    RATE_WINDOW_MS,
+    options.sessionRateLimitPerMin ?? SESSION_RATE_MAX_PER_WINDOW
+  );
+
+  const authenticateRequest = (
+    req: Request
+  ):
+    | { authenticated: true; scopes: SandboxScope[]; method: 'api-key' | 'session' }
+    | { authenticated: false; reason: string } => {
+    const authHeader = req.headers.authorization;
+    const bearerToken =
+      typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : null;
+    const apiKeyHeader =
+      typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'].trim() : null;
+
+    if (configuredApiKey) {
+      if (apiKeyHeader) {
+        if (constantTimeEqualsSecret(apiKeyHeader, configuredApiKey)) {
+          return { authenticated: true, scopes: ALL_SANDBOX_SCOPES, method: 'api-key' };
+        }
+        return { authenticated: false, reason: 'Unauthorized: invalid API key.' };
+      }
+      if (bearerToken && constantTimeEqualsSecret(bearerToken, configuredApiKey)) {
+        return { authenticated: true, scopes: ALL_SANDBOX_SCOPES, method: 'api-key' };
+      }
+    }
+
+    const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME);
+    const candidateToken = bearerToken ?? cookieToken;
+    if (!candidateToken) {
+      return { authenticated: false, reason: 'Unauthorized: authentication token required.' };
+    }
+
+    const verified = verifySandboxSessionToken(
+      candidateToken,
+      sessionSecret,
+      getClientKey(req),
+      enforceIpBinding
+    );
+    if (!verified.valid) {
+      return { authenticated: false, reason: `Unauthorized: ${verified.reason}` };
+    }
+    return {
+      authenticated: true,
+      scopes: verified.payload.scopes,
+      method: 'session',
+    };
+  };
+
+  const enforceCsrfAndAuth = (requiredScope: SandboxScope) => {
+    return (req: Request, res: Response, next: NextFunction): void => {
+      const originCheck = isSameOriginHeaderValid(req);
+      if (!originCheck.ok) {
+        res.status(403).json({
+          success: false,
+          blocked: true,
+          error: originCheck.reason,
+        });
+        return;
+      }
+
+      const auth = authenticateRequest(req);
+      if (!auth.authenticated) {
+        res.setHeader('WWW-Authenticate', 'Bearer realm="PowerScript Sandbox"');
+        res.status(401).json({
+          success: false,
+          blocked: true,
+          error: auth.reason,
+        });
+        return;
+      }
+
+      if (!auth.scopes.includes(requiredScope)) {
+        res.status(403).json({
+          success: false,
+          blocked: true,
+          error: `Forbidden: token lacks required scope "${requiredScope}".`,
+        });
+        return;
+      }
+
+      next();
+    };
+  };
 
   app.disable('x-powered-by');
   app.use(express.json({ limit: '160kb', strict: true }));
@@ -557,16 +860,82 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     next(err);
   });
 
-  app.use((_req, res, next) => {
+  // Strict baseline security headers on all routes + hardened framing/caching on /api/*
+  app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), usb=()');
+    if (req.path.startsWith('/api/')) {
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+    }
     next();
   });
 
-  app.get('/api/sandbox/status', (_req: Request, res: Response) => {
+  app.get('/api/auth/session', (req: Request, res: Response) => {
+    const rate = sessionLimiter.consume(getClientKey(req));
+    if (!rate.allowed) {
+      res.setHeader('Retry-After', String(rate.retryAfterSec));
+      res.status(429).json({
+        error: 'Rate limit exceeded for /api/auth/session. Please retry shortly.',
+      });
+      return;
+    }
+
+    const originCheck = isSameOriginHeaderValid(req);
+    if (!originCheck.ok) {
+      res.status(403).json({ error: originCheck.reason });
+      return;
+    }
+
+    const { token, expiresAt } = signSandboxSessionToken({
+      secret: sessionSecret,
+      scopes: ALL_SANDBOX_SCOPES,
+      clientIp: getClientKey(req),
+      ttlMs: sessionTtlMs,
+    });
+
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    const maxAgeSec = Math.max(1, Math.ceil(sessionTtlMs / 1000));
+    const cookieFlags = [
+      `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+      'HttpOnly',
+      'SameSite=Strict',
+      'Path=/api',
+      `Max-Age=${maxAgeSec}`,
+    ];
+    if (isHttps) {
+      cookieFlags.push('Secure');
+    }
+    res.setHeader('Set-Cookie', cookieFlags.join('; '));
+
+    res.json({
+      token,
+      tokenType: 'Bearer',
+      expiresAt,
+      scopes: ALL_SANDBOX_SCOPES,
+    });
+  });
+
+  app.get('/api/sandbox/status', (req: Request, res: Response) => {
+    const auth = authenticateRequest(req);
+    if (!auth.authenticated || !auth.scopes.includes('status')) {
+      res.json({
+        ok: true,
+        mode: 'fail-closed',
+        authenticated: false,
+      });
+      return;
+    }
+
     res.json({
       ok: true,
       mode: 'fail-closed',
+      authenticated: true,
       layers: {
         staticAnalyzer: 'fail-closed (SEC000 on incomplete analysis)',
         capabilityManager: 'strict prototype, eval, host-global, and computed-gadget blocking',
@@ -574,7 +943,7 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
         ssrfProtection:
           'canonical IPv4/IPv6 CIDR validation + DNS pre-resolution with pinned socket IP + redirect blocking + blocked cookie/metadata headers',
         runtimeIsolation:
-          'OS child process pool (stripped env, os.tmpdir cwd, 64MB heap cap, --no-addons, SIGKILL watchdog) + V8 vm context (codeGeneration strings/wasm disabled)',
+          'OS child process pool (stripped env, os.tmpdir cwd, 64MB heap cap, --no-addons, SIGKILL watchdog) + V8 vm context (codeGeneration strings/wasm disabled) + /sandbox VFS chroot',
       },
       limits: {
         maxSourceChars: MAX_SOURCE_CHARS,
@@ -591,7 +960,7 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     });
   });
 
-  app.post('/api/compile', (req: Request, res: Response) => {
+  app.post('/api/compile', enforceCsrfAndAuth('compile'), (req: Request, res: Response) => {
     const rate = compileLimiter.consume(getClientKey(req));
     if (!rate.allowed) {
       res.setHeader('Retry-After', String(rate.retryAfterSec));
@@ -605,11 +974,23 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
       source?: unknown;
       interactiveAsync?: unknown;
       optimize?: unknown;
-      securityPolicy?: PartialCompilerSecurityPolicy;
+      securityPolicy?: unknown;
     } | null;
 
-    if (!body || Array.isArray(body) || typeof body !== 'object' || typeof body.source !== 'string') {
+    if (!isPlainObject(body) || typeof body.source !== 'string') {
       res.status(400).json({ error: 'Invalid request: "source" must be a string.' });
+      return;
+    }
+    if (body.interactiveAsync !== undefined && typeof body.interactiveAsync !== 'boolean') {
+      res.status(400).json({ error: 'Invalid request: "interactiveAsync" must be a boolean.' });
+      return;
+    }
+    if (body.optimize !== undefined && typeof body.optimize !== 'boolean') {
+      res.status(400).json({ error: 'Invalid request: "optimize" must be a boolean.' });
+      return;
+    }
+    if (body.securityPolicy !== undefined && !isPlainObject(body.securityPolicy)) {
+      res.status(400).json({ error: 'Invalid request: "securityPolicy" must be an object.' });
       return;
     }
     if (body.source.length > MAX_SOURCE_CHARS) {
@@ -625,7 +1006,9 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
       return;
     }
 
-    const safePolicy = sanitizeServerSecurityPolicy(body.securityPolicy);
+    const safePolicy = sanitizeServerSecurityPolicy(
+      body.securityPolicy as PartialCompilerSecurityPolicy | undefined
+    );
     let compiled;
     try {
       compiled = compileEasyJS(body.source, {
@@ -659,7 +1042,7 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     });
   });
 
-  app.post('/api/execute', async (req: Request, res: Response) => {
+  app.post('/api/execute', enforceCsrfAndAuth('execute'), async (req: Request, res: Response) => {
     const rate = executeLimiter.consume(getClientKey(req));
     if (!rate.allowed) {
       res.setHeader('Retry-After', String(rate.retryAfterSec));
@@ -674,13 +1057,39 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     const body = req.body as {
       source?: unknown;
       stdin?: unknown;
-      securityPolicy?: PartialCompilerSecurityPolicy;
+      securityPolicy?: unknown;
     } | null;
 
-    if (!body || Array.isArray(body) || typeof body !== 'object' || typeof body.source !== 'string') {
+    if (!isPlainObject(body) || typeof body.source !== 'string') {
       res.status(400).json({ error: 'Invalid request: "source" must be a string.' });
       return;
     }
+    if (body.securityPolicy !== undefined && !isPlainObject(body.securityPolicy)) {
+      res.status(400).json({ error: 'Invalid request: "securityPolicy" must be an object.' });
+      return;
+    }
+    if (body.stdin !== undefined) {
+      if (!Array.isArray(body.stdin)) {
+        res.status(400).json({ error: 'Invalid request: "stdin" must be an array.' });
+        return;
+      }
+      if (body.stdin.length > MAX_STDIN_ITEMS) {
+        res.status(413).json({
+          error: `Stdin exceeds maximum item limit (${MAX_STDIN_ITEMS} items).`,
+        });
+        return;
+      }
+      for (const item of body.stdin) {
+        const t = typeof item;
+        if (t !== 'string' && t !== 'number' && t !== 'boolean') {
+          res.status(400).json({
+            error: 'Invalid request: "stdin" items must be primitive strings, numbers, or booleans.',
+          });
+          return;
+        }
+      }
+    }
+
     if (body.source.length > MAX_SOURCE_CHARS) {
       res.status(413).json({
         error: `Source code exceeds maximum size limit (${MAX_SOURCE_CHARS} characters).`,
@@ -695,7 +1104,9 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     }
 
     const stdin = sanitizeStdinArray(body.stdin);
-    const safePolicy = sanitizeServerSecurityPolicy(body.securityPolicy);
+    const safePolicy = sanitizeServerSecurityPolicy(
+      body.securityPolicy as PartialCompilerSecurityPolicy | undefined
+    );
 
     // Fail-closed compile & static security verification BEFORE spawning sandbox worker
     let compiled;
@@ -817,6 +1228,10 @@ async function startServer(): Promise<void> {
   } else if (existsSync(DIST_DIR)) {
     app.use(express.static(DIST_DIR));
     app.get('*', (_req, res) => {
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; child-src 'self' blob: data:; frame-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
+      );
       res.sendFile(path.join(DIST_DIR, 'index.html'));
     });
   }

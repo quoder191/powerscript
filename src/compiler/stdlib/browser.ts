@@ -65,7 +65,17 @@ export const BROWSER_STDLIB_SOURCE = `
   };
 
   const browserOpen = (url) => {
-    const target = String(url ?? "");
+    const raw = String(url ?? "").trim();
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error("SecurityError: Invalid browser URL '" + raw + "'");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("SecurityError: Blocked browser URL protocol '" + parsed.protocol + "'");
+    }
+    const target = parsed.toString();
     if (ioHandler && typeof ioHandler.onBrowser === "function") {
       ioHandler.onBrowser(target);
     } else {

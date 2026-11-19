@@ -129,6 +129,7 @@ export class CapabilitySecurityManager {
   private readonly networkManager: NetworkPolicyManager;
   private readonly diagnostics: SecurityDiagnostic[] = [];
   private readonly scopes: Array<Set<string>> = [];
+  private readonly staticStringEnv: Array<Map<string, string>> = [];
   private analysisComplete = true;
   private depth = 0;
   private nodeCount = 0;
@@ -153,6 +154,7 @@ export class CapabilitySecurityManager {
   analyze(program: ProgramNode): CapabilitySecurityResult {
     this.diagnostics.length = 0;
     this.scopes.length = 0;
+    this.staticStringEnv.length = 0;
     this.analysisComplete = true;
     this.depth = 0;
     this.nodeCount = 0;
@@ -191,11 +193,15 @@ export class CapabilitySecurityManager {
 
   private pushScope(): void {
     this.scopes.push(new Set());
+    this.staticStringEnv.push(new Map());
   }
 
   private popScope(): void {
     if (this.scopes.length > 0) {
       this.scopes.pop();
+    }
+    if (this.staticStringEnv.length > 0) {
+      this.staticStringEnv.pop();
     }
   }
 
@@ -204,6 +210,48 @@ export class CapabilitySecurityManager {
     if (top) {
       top.add(name);
     }
+  }
+
+  private setStaticString(name: string, val: string): void {
+    const top = this.staticStringEnv[this.staticStringEnv.length - 1];
+    if (top) {
+      top.set(name, val);
+    }
+  }
+
+  private clearStaticString(name: string): void {
+    for (let i = this.staticStringEnv.length - 1; i >= 0; i--) {
+      if (this.staticStringEnv[i].has(name)) {
+        this.staticStringEnv[i].delete(name);
+      }
+    }
+  }
+
+  private lookupStaticString(name: string): string | null {
+    for (let i = this.staticStringEnv.length - 1; i >= 0; i--) {
+      if (this.staticStringEnv[i].has(name)) {
+        return this.staticStringEnv[i].get(name) ?? null;
+      }
+    }
+    return null;
+  }
+
+  private tryEvaluateStaticString(expr: ExpressionNode, depth = 0): string | null {
+    if (depth > 16 || !expr) return null;
+    if (expr.kind === 'Literal' && typeof expr.value === 'string') {
+      return expr.value;
+    }
+    if (expr.kind === 'Identifier') {
+      return this.lookupStaticString(expr.name);
+    }
+    if (expr.kind === 'BinaryExpression' && expr.operator === '+') {
+      const left = this.tryEvaluateStaticString(expr.left, depth + 1);
+      const right = this.tryEvaluateStaticString(expr.right, depth + 1);
+      if (left !== null && right !== null) {
+        return left + right;
+      }
+    }
+    return null;
   }
 
   private isDeclared(name: string): boolean {
@@ -279,6 +327,12 @@ export class CapabilitySecurityManager {
       case 'VarDeclaration':
         if (stmt.initializer) {
           this.visitExpression(stmt.initializer);
+          const staticVal = this.tryEvaluateStaticString(stmt.initializer);
+          if (staticVal !== null) {
+            this.setStaticString(stmt.name, staticVal);
+          } else {
+            this.clearStaticString(stmt.name);
+          }
         }
         if (stmt.name === 'globalThis' && this.policy.globals.globalThisMode !== 'sandboxed') {
           this.error(
@@ -422,7 +476,36 @@ export class CapabilitySecurityManager {
         this.visitExpression(stmt.expression);
         break;
 
-      case 'ImportStatement':
+      case 'ImportStatement': {
+        const rawMod = String(stmt.modulePath ?? '').trim();
+        const modLower = rawMod.toLowerCase();
+        const BLOCKED_HOST_MODULES = new Set([
+          'fs', 'node:fs', 'fs/promises', 'node:fs/promises',
+          'child_process', 'node:child_process',
+          'net', 'node:net', 'dgram', 'node:dgram', 'tls', 'node:tls',
+          'http', 'node:http', 'https', 'node:https', 'http2', 'node:http2',
+          'os', 'node:os', 'path', 'node:path', 'vm', 'node:vm',
+          'worker_threads', 'node:worker_threads', 'cluster', 'node:cluster',
+          'process', 'node:process', 'module', 'node:module', 'inspector', 'node:inspector',
+          'dns', 'node:dns', 'readline', 'node:readline',
+        ]);
+        if (
+          !rawMod ||
+          rawMod.includes('..') ||
+          rawMod.includes('\0') ||
+          /^[a-z]+:/i.test(rawMod) ||
+          BLOCKED_HOST_MODULES.has(modLower)
+        ) {
+          this.error(
+            'SEC105',
+            `Importing host or untrusted module '${rawMod}' is blocked by security policy.`,
+            stmt.line,
+            stmt.column,
+            'Only built-in sandboxed stdlib/* modules and verified registry packages are allowed.'
+          );
+        }
+        break;
+      }
       case 'EnumDeclaration':
       case 'TraitDeclaration':
       case 'StyleStatement':
@@ -633,16 +716,16 @@ export class CapabilitySecurityManager {
 
       case 'IndexExpression': {
         if (this.policy.globals.forbidPrototypeAccess) {
+          const resolvedStaticIndex = this.tryEvaluateStaticString(expr.index);
           if (
-            expr.index.kind === 'Literal' &&
-            typeof expr.index.value === 'string' &&
-            (BLOCKED_PROTOTYPE_PROPS.has(expr.index.value) ||
-              expr.index.value === 'cookie' ||
-              DYNAMIC_EVAL_GLOBALS.has(expr.index.value))
+            resolvedStaticIndex !== null &&
+            (BLOCKED_PROTOTYPE_PROPS.has(resolvedStaticIndex) ||
+              resolvedStaticIndex === 'cookie' ||
+              DYNAMIC_EVAL_GLOBALS.has(resolvedStaticIndex))
           ) {
             this.error(
               'SEC103',
-              `Bracket access to '${expr.index.value}' is blocked by security policy.`,
+              `Bracket access to '${resolvedStaticIndex}' is blocked by security policy.`,
               expr.line,
               expr.column
             );
@@ -677,6 +760,14 @@ export class CapabilitySecurityManager {
       }
 
       case 'AssignmentExpression': {
+        if (expr.target.kind === 'Identifier') {
+          const nextStatic = this.tryEvaluateStaticString(expr.value);
+          if (nextStatic !== null) {
+            this.setStaticString(expr.target.name, nextStatic);
+          } else {
+            this.clearStaticString(expr.target.name);
+          }
+        }
         if (
           this.isGlobalThisRoot(expr.target) &&
           this.policy.globals.globalThisMode === 'readonly'
