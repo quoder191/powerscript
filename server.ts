@@ -8,12 +8,26 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import {
-  compileEasyJS,
-  DEFAULT_NETWORK_SECURITY_POLICY,
-  type PartialCompilerSecurityPolicy,
-  type ExecutionResult,
+import type {
+  PartialCompilerSecurityPolicy,
+  ExecutionResult,
 } from './src/compiler/index.ts';
+
+let cachedCompilerPromise: Promise<typeof import('./src/compiler/index.ts')> | null = null;
+
+function getCompilerModule(): Promise<typeof import('./src/compiler/index.ts')> {
+  if (!cachedCompilerPromise) {
+    cachedCompilerPromise = (async () => {
+      try {
+        const { tsImport } = await import('tsx/esm/api');
+        return (await tsImport('./src/compiler/index.ts', import.meta.url)) as typeof import('./src/compiler/index.ts');
+      } catch {
+        return await import('./src/compiler/index.ts');
+      }
+    })();
+  }
+  return cachedCompilerPromise;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -136,7 +150,8 @@ function sanitizeDomainList(raw: unknown): string[] | undefined {
 }
 
 export function sanitizeServerSecurityPolicy(
-  raw?: PartialCompilerSecurityPolicy
+  raw?: PartialCompilerSecurityPolicy,
+  defaultBlockedHeaders: readonly string[] = []
 ): PartialCompilerSecurityPolicy {
   const requestedGlobalMode = raw?.globals?.globalThisMode;
   const safeGlobalMode =
@@ -170,7 +185,7 @@ export function sanitizeServerSecurityPolicy(
       allowCredentials: false,
       blockPrivateNetworks: true,
       allowDangerousPorts: false,
-      blockedHeaders: [...DEFAULT_NETWORK_SECURITY_POLICY.blockedHeaders],
+      blockedHeaders: [...defaultBlockedHeaders],
       allowedDomains: sanitizeDomainList(raw?.network?.allowedDomains),
       blockedDomains: sanitizeDomainList(raw?.network?.blockedDomains),
       maxRedirects: 0,
@@ -695,12 +710,19 @@ class WorkerConcurrencyPool {
   private activeCount = 0;
   private readonly queue: QueuedWorkerSlot[] = [];
   private readonly activeChildren = new Set<ChildProcess>();
+  private readonly maxConcurrent: number;
+  private readonly maxQueueSize: number;
+  private readonly maxQueueWaitMs: number;
 
   constructor(
-    private readonly maxConcurrent: number,
-    private readonly maxQueueSize: number,
-    private readonly maxQueueWaitMs: number
-  ) {}
+    maxConcurrent: number,
+    maxQueueSize: number,
+    maxQueueWaitMs: number
+  ) {
+    this.maxConcurrent = maxConcurrent;
+    this.maxQueueSize = maxQueueSize;
+    this.maxQueueWaitMs = maxQueueWaitMs;
+  }
 
   getStats(): { activeWorkers: number; queuedJobs: number; maxConcurrent: number; maxQueueSize: number } {
     return {
@@ -804,11 +826,16 @@ class WorkerConcurrencyPool {
 
 class SlidingWindowRateLimiter {
   private readonly buckets = new Map<string, number[]>();
+  private readonly windowMs: number;
+  private readonly maxRequests: number;
 
   constructor(
-    private readonly windowMs: number,
-    private readonly maxRequests: number
-  ) {}
+    windowMs: number,
+    maxRequests: number
+  ) {
+    this.windowMs = windowMs;
+    this.maxRequests = maxRequests;
+  }
 
   consume(key: string): { allowed: boolean; retryAfterSec: number } {
     const now = Date.now();
@@ -1929,7 +1956,7 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     });
   });
 
-  app.post('/api/compile', enforceCsrfAuthAndReplay('compile'), (req: Request, res: Response) => {
+  app.post('/api/compile', enforceCsrfAuthAndReplay('compile'), async (req: Request, res: Response) => {
     const clientAddr = (res.locals as { clientAddr: ClientAddressResolution }).clientAddr;
     const rate = compileLimiter.consume(clientAddr.clientIp);
     if (!rate.allowed) {
@@ -1976,8 +2003,10 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
       return;
     }
 
+    const { compileEasyJS, DEFAULT_NETWORK_SECURITY_POLICY } = await getCompilerModule();
     const safePolicy = sanitizeServerSecurityPolicy(
-      body.securityPolicy as PartialCompilerSecurityPolicy | undefined
+      body.securityPolicy as PartialCompilerSecurityPolicy | undefined,
+      DEFAULT_NETWORK_SECURITY_POLICY.blockedHeaders
     );
     let compiled;
     try {
@@ -2085,8 +2114,10 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     }
 
     const stdin = sanitizeStdinArray(body.stdin);
+    const { compileEasyJS, DEFAULT_NETWORK_SECURITY_POLICY } = await getCompilerModule();
     const safePolicy = sanitizeServerSecurityPolicy(
-      body.securityPolicy as PartialCompilerSecurityPolicy | undefined
+      body.securityPolicy as PartialCompilerSecurityPolicy | undefined,
+      DEFAULT_NETWORK_SECURITY_POLICY.blockedHeaders
     );
 
     let compiled;
@@ -2204,6 +2235,7 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
 }
 
 async function startServer(): Promise<void> {
+  await getCompilerModule();
   const osCaps = probeOsSandboxCapabilities();
   const app = createSandboxServerApp({ osCapabilitiesOverride: osCaps });
   const isProd = process.env.NODE_ENV === 'production';
