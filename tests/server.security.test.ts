@@ -177,27 +177,47 @@ export async function runServerAdversarialTests(): Promise<TestCaseResult[]> {
         }
         assertTrue(weakSecretErr, 'Short/weak sessionSecret must fail closed at startup');
 
-        // Platform unset sentinel regression check ("Nothing" must behave as unset, never as a valid API key)
+        // Platform unset sentinel & 16-char placeholder regression check
         const prevMode = process.env.POWERSCRIPT_DEPLOYMENT_MODE;
         const prevKey = process.env.POWERSCRIPT_API_KEY;
         const prevSecret = process.env.POWERSCRIPT_SESSION_SECRET;
         const prevProxies = process.env.POWERSCRIPT_TRUSTED_PROXIES;
+        const prevNodeEnv = process.env.NODE_ENV;
         try {
+          process.env.NODE_ENV = 'production';
           process.env.POWERSCRIPT_DEPLOYMENT_MODE = 'Nothing';
-          process.env.POWERSCRIPT_API_KEY = 'Nothing';
-          process.env.POWERSCRIPT_SESSION_SECRET = 'Nothing';
+          process.env.POWERSCRIPT_API_KEY = 'PlatformKey16Chr';
+          process.env.POWERSCRIPT_SESSION_SECRET = 'PlatformSec16Chr';
           process.env.POWERSCRIPT_TRUSTED_PROXIES = 'Nothing';
           await withTestServer({}, async (baseUrl) => {
             const rejectedSentinelKey = await fetch(`${baseUrl}/api/compile`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-api-key': 'Nothing' },
+              headers: { 'Content-Type': 'application/json', 'x-api-key': 'PlatformKey16Chr' },
               body: JSON.stringify({ source: 'print(1)' }),
             });
             assertTrue(
               rejectedSentinelKey.status === 401,
-              `Platform sentinel "Nothing" must NEVER authenticate as an API key, got ${rejectedSentinelKey.status}`
+              `16-char env API key placeholder must NEVER authenticate in public-playground, got ${rejectedSentinelKey.status}`
+            );
+
+            const sessionOk = await fetch(`${baseUrl}/api/auth/session`);
+            assertTrue(
+              sessionOk.status === 200,
+              `public-playground must start and issue playground session even with 16-char env secret placeholder, got ${sessionOk.status}`
             );
           });
+
+          let shortProdEnvSecretErr = false;
+          try {
+            process.env.POWERSCRIPT_DEPLOYMENT_MODE = 'production-private';
+            createSandboxServerApp();
+          } catch (err) {
+            shortProdEnvSecretErr = err instanceof ServerConfigurationError;
+          }
+          assertTrue(
+            shortProdEnvSecretErr,
+            'production-private must still fail closed when POWERSCRIPT_SESSION_SECRET env is < 32 chars'
+          );
         } finally {
           if (prevMode === undefined) delete process.env.POWERSCRIPT_DEPLOYMENT_MODE;
           else process.env.POWERSCRIPT_DEPLOYMENT_MODE = prevMode;
@@ -207,6 +227,8 @@ export async function runServerAdversarialTests(): Promise<TestCaseResult[]> {
           else process.env.POWERSCRIPT_SESSION_SECRET = prevSecret;
           if (prevProxies === undefined) delete process.env.POWERSCRIPT_TRUSTED_PROXIES;
           else process.env.POWERSCRIPT_TRUSTED_PROXIES = prevProxies;
+          if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+          else process.env.NODE_ENV = prevNodeEnv;
         }
 
         // [4, 5, 6, 7] Private mode enforcement

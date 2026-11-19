@@ -935,7 +935,7 @@ export async function executeCompiledInWorker(
       let child: ChildProcess;
       if (useOsSandbox && bundlePath && scratchDir) {
         const innerShell =
-          'mount -t tmpfs -o size=1M,ro,noexec,nosuid,nodev tmpfs "$1" && cd "$1" && exec prlimit --cpu=5 --fsize=0 --nofile=32 --core=0 setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs "$2" --permission --allow-fs-read="$3" --max-old-space-size=64 --max-semi-space-size=8 --no-addons "$3"';
+          'mount -t tmpfs -o size=1M,ro,noexec,nosuid,nodev tmpfs "$1" && cd "$1" && exec prlimit --cpu=6 --fsize=0 --nofile=32 --core=0 setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs "$2" --permission --allow-fs-read="$3" --max-old-space-size=64 --max-semi-space-size=8 --no-addons "$3"';
 
         child = spawn(
           'unshare',
@@ -1104,17 +1104,25 @@ export async function executeCompiledInWorker(
           }
         }
         const durationMs = Number((performance.now() - start).toFixed(2));
+        const isTimeoutKill =
+          killedByTimeout ||
+          signalName === 'SIGKILL' ||
+          signalName === 'SIGXCPU' ||
+          code === 137 ||
+          code === 152;
         const detail = stderrText.trim()
           ? stderrText.trim().slice(0, 400)
           : `process exited with code=${code ?? 'null'} signal=${signalName ?? 'none'}`;
         finalize({
-          killedByTimeout: signalName === 'SIGKILL' || signalName === 'SIGXCPU' || killedByTimeout,
+          killedByTimeout: isTimeoutKill,
           osSandboxEnforced: useOsSandbox,
           execution: {
             logs: [],
             pointerEvents: [],
             durationMs,
-            error: `SecurityError: Sandbox worker terminated unexpectedly (${detail})`,
+            error: isTimeoutKill
+              ? `SecurityError: Isolated sandbox worker terminated due to CPU/time limit (${detail})`
+              : `SecurityError: Sandbox worker terminated unexpectedly (${detail})`,
           },
         });
       });
@@ -1373,17 +1381,9 @@ function readNormalizedEnvVar(rawVal: string | undefined): string | undefined {
   return trimmed;
 }
 
-function resolveDeploymentMode(
-  raw?: unknown,
-  hasConfiguredApiKey = Boolean(readNormalizedEnvVar(process.env.POWERSCRIPT_API_KEY))
-): DeploymentMode {
+function resolveDeploymentMode(raw?: unknown): DeploymentMode {
   const envMode = readNormalizedEnvVar(process.env.POWERSCRIPT_DEPLOYMENT_MODE);
-  const mode =
-    raw ??
-    envMode ??
-    (process.env.NODE_ENV === 'production' && hasConfiguredApiKey
-      ? 'production-private'
-      : 'public-playground');
+  const mode = raw ?? envMode ?? 'public-playground';
   if (mode === 'public-playground' || mode === 'production-private') {
     return mode;
   }
@@ -1412,14 +1412,16 @@ export interface SandboxServerAppOptions {
 
 export function createSandboxServerApp(options: SandboxServerAppOptions = {}): Express {
   const app = express();
+  const deploymentMode = resolveDeploymentMode(options.deploymentMode);
+  const envApiKey = readNormalizedEnvVar(process.env.POWERSCRIPT_API_KEY) ?? '';
+  // In public-playground mode, only honor an explicitly passed options.apiKey so
+  // auto-injected platform placeholders for POWERSCRIPT_API_KEY can never authenticate.
   const configuredApiKey =
     options.apiKey !== undefined
       ? options.apiKey
-      : readNormalizedEnvVar(process.env.POWERSCRIPT_API_KEY) ?? '';
-  const deploymentMode = resolveDeploymentMode(
-    options.deploymentMode,
-    Boolean(configuredApiKey)
-  );
+      : deploymentMode === 'production-private'
+        ? envApiKey
+        : '';
   const trustedProxyRules = parseTrustedProxyConfig(
     options.trustedProxies !== undefined
       ? options.trustedProxies
@@ -1434,14 +1436,24 @@ export function createSandboxServerApp(options: SandboxServerAppOptions = {}): E
     options.sessionSecret !== undefined
       ? options.sessionSecret
       : readNormalizedEnvVar(process.env.POWERSCRIPT_SESSION_SECRET);
+  let validatedSessionSecret: string | undefined;
   if (rawSessionSecret !== undefined) {
     if (rawSessionSecret.length < MIN_SESSION_SECRET_LEN || isWeakSecret(rawSessionSecret)) {
-      throw new ServerConfigurationError(
-        `Invalid sessionSecret: must be at least ${MIN_SESSION_SECRET_LEN} characters and non-trivial.`
+      if (options.sessionSecret !== undefined || deploymentMode === 'production-private') {
+        throw new ServerConfigurationError(
+          `Invalid sessionSecret: must be at least ${MIN_SESSION_SECRET_LEN} characters and non-trivial.`
+        );
+      }
+      // In public-playground mode, ignore short/weak/placeholder env secrets (e.g. 16-char platform
+      // secret placeholders) and fall back to a fresh CSPRNG ephemeral key instead.
+      console.warn(
+        '[PowerScript Sandbox Server] Ignoring short/weak POWERSCRIPT_SESSION_SECRET in public-playground mode; using ephemeral CSPRNG secret.'
       );
+    } else {
+      validatedSessionSecret = rawSessionSecret;
     }
   }
-  const sessionSecret = rawSessionSecret || randomBytes(32).toString('hex');
+  const sessionSecret = validatedSessionSecret || randomBytes(32).toString('hex');
 
   if (deploymentMode === 'production-private') {
     if (!configuredApiKey) {
@@ -2250,5 +2262,11 @@ process.once('exit', () => {
 });
 
 if (checkIsMainModule()) {
-  void startServer();
+  startServer().catch((err: unknown) => {
+    console.error(
+      '[PowerScript Startup Error]',
+      err instanceof Error ? (err.stack || err.message) : String(err)
+    );
+    process.exit(1);
+  });
 }
